@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Self-Sufficient AI Voice Agent System
-Complete voice agent system with NO subscription dependencies
-Uses: Local Whisper, Local TTS, WebRTC, Open-source components only
+Self-Sufficient AI Voice Agent System - Lightweight Version
+Uses cloud APIs for speech processing to reduce deployment size
 """
 
 from fastapi import FastAPI, Request, Response, HTTPException, WebSocket, WebSocketDisconnect
@@ -26,7 +25,6 @@ from dataclasses import dataclass, asdict
 import requests
 from bs4 import BeautifulSoup
 import numpy as np
-from sentence_transformers import SentenceTransformer
 import pickle
 import threading
 import time
@@ -40,12 +38,10 @@ import ssl
 from pathlib import Path
 import queue
 
-# Local AI imports
-import whisper
-import torch
-from transformers import pipeline
-import pyttsx3
+# Lightweight AI imports
 import speech_recognition as sr
+from gtts import gTTS
+import openai
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -53,12 +49,11 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 class Config:
-    # Local AI Models
-    WHISPER_MODEL = "base"  # tiny, base, small, medium, large
-    TTS_ENGINE = "pyttsx3"  # Local TTS engine
-    LLM_MODEL = "microsoft/DialoGPT-medium"  # Local conversational AI
+    # Cloud AI Services (lighter than local models)
+    SPEECH_RECOGNITION_SERVICE = "google"  # Uses Google's free API
+    TTS_SERVICE = "gtts"  # Google Text-to-Speech
     
-    # Fallback to OpenAI if API key provided (optional)
+    # OpenAI for conversations (optional but recommended)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
     
     # Application settings
@@ -80,13 +75,13 @@ class Config:
     
     # Server settings
     HOST = "0.0.0.0"
-    PORT = 8000
+    PORT = int(os.getenv("PORT", 8000))
     
     # WebRTC settings
     WEBRTC_PORT = 8001
     SIP_PORT = 5060
     
-    # Routing keywords - FIXED: Added missing configuration
+    # Routing keywords
     ROUTE_TO_HUMAN_KEYWORDS = [
         "human", "person", "agent", "representative", 
         "manager", "supervisor", "help me", "speak to someone"
@@ -129,193 +124,163 @@ class UnknownQuestion:
     resolved: bool = False
     suggested_answer: Optional[str] = None
 
-class LocalAIEngine:
-    """Local AI processing engine - no external APIs required"""
+class LightweightAIEngine:
+    """Lightweight AI engine using cloud services"""
     
     def __init__(self):
-        self.whisper_model = None
-        self.tts_engine = None
-        self.llm_pipeline = None
-        self.sentence_transformer = None
-        self._initialize_models()
+        self.recognizer = sr.Recognizer()
+        self.openai_client = None
+        if Config.OPENAI_API_KEY:
+            self.openai_client = openai.OpenAI(api_key=Config.OPENAI_API_KEY)
+        self._initialize_services()
     
-    def _initialize_models(self):
-        """Initialize all local AI models"""
-        logger.info("Initializing local AI models...")
+    def _initialize_services(self):
+        """Initialize speech recognition and other services"""
+        logger.info("Initializing lightweight AI services...")
         
         try:
-            # Initialize Whisper for speech recognition
-            logger.info("Loading Whisper model...")
-            self.whisper_model = whisper.load_model(Config.WHISPER_MODEL)
+            # Configure speech recognition
+            self.recognizer.energy_threshold = 300
+            self.recognizer.dynamic_energy_threshold = True
+            self.recognizer.pause_threshold = 0.8
             
-            # Initialize local TTS
-            logger.info("Initializing TTS engine...")
-            self.tts_engine = pyttsx3.init()
-            self.tts_engine.setProperty('rate', 150)  # Speed
-            self.tts_engine.setProperty('volume', 0.9)  # Volume
-            
-            # Initialize sentence transformer for embeddings
-            logger.info("Loading sentence transformer...")
-            self.sentence_transformer = SentenceTransformer('all-MiniLM-L6-v2')
-            
-            # Initialize conversational AI
             if Config.OPENAI_API_KEY:
                 logger.info("OpenAI API key found - will use GPT for conversations")
             else:
-                logger.info("Loading local conversational AI...")
-                try:
-                    self.llm_pipeline = pipeline(
-                        "conversational",
-                        model=Config.LLM_MODEL,
-                        device=0 if torch.cuda.is_available() else -1
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not load local LLM: {e}")
-                    logger.info("Will use rule-based responses")
+                logger.info("No OpenAI API key - will use rule-based responses")
             
-            logger.info("All AI models initialized successfully!")
+            logger.info("Lightweight AI services initialized successfully!")
             
         except Exception as e:
-            logger.error(f"Error initializing AI models: {e}")
+            logger.error(f"Error initializing AI services: {e}")
             raise
     
     def speech_to_text(self, audio_data: bytes) -> str:
-        """Convert speech to text using local Whisper"""
+        """Convert speech to text using Google's speech recognition"""
         try:
             # Save audio data to temporary file
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
                 temp_file.write(audio_data)
                 temp_path = temp_file.name
             
-            # Transcribe with Whisper
-            result = self.whisper_model.transcribe(temp_path)
-            text = result["text"].strip()
-            
-            # Clean up temp file
-            os.unlink(temp_path)
-            
-            logger.info(f"Transcribed: {text}")
-            return text
+            # Use speech recognition with the audio file
+            with sr.AudioFile(temp_path) as source:
+                audio = self.recognizer.record(source)
+                
+            # Recognize speech using Google's free API
+            try:
+                text = self.recognizer.recognize_google(audio)
+                logger.info(f"Transcribed: {text}")
+                
+                # Clean up temp file
+                os.unlink(temp_path)
+                return text.strip()
+                
+            except sr.UnknownValueError:
+                logger.warning("Could not understand audio")
+                os.unlink(temp_path)
+                return ""
+            except sr.RequestError as e:
+                logger.error(f"Could not request results from Google Speech Recognition service; {e}")
+                os.unlink(temp_path)
+                return ""
             
         except Exception as e:
             logger.error(f"Speech to text error: {e}")
             return ""
     
     def text_to_speech(self, text: str) -> bytes:
-        """Convert text to speech using local TTS - FIXED: Threading issues"""
+        """Convert text to speech using Google Text-to-Speech"""
         try:
-            # Create temporary file for audio output
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            # Create gTTS object
+            tts = gTTS(text=text, lang='en', slow=False)
+            
+            # Save to temporary file
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
+                tts.save(temp_file.name)
                 temp_path = temp_file.name
             
-            # Use subprocess to run TTS to avoid threading issues
-            try:
-                # Try using espeak as a more reliable alternative
-                subprocess.run([
-                    'espeak', '-w', temp_path, '-s', '150', '-v', 'en', text
-                ], check=True, capture_output=True)
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                # Fallback to pyttsx3 with proper threading
-                result_queue = queue.Queue()
-                
-                def tts_worker():
-                    try:
-                        engine = pyttsx3.init()
-                        engine.setProperty('rate', 150)
-                        engine.setProperty('volume', 0.9)
-                        engine.save_to_file(text, temp_path)
-                        engine.runAndWait()
-                        result_queue.put(True)
-                    except Exception as e:
-                        result_queue.put(e)
-                
-                thread = threading.Thread(target=tts_worker)
-                thread.start()
-                thread.join(timeout=10)  # 10 second timeout
-                
-                result = result_queue.get_nowait() if not result_queue.empty() else False
-                if isinstance(result, Exception):
-                    raise result
-                elif not result:
-                    raise Exception("TTS timeout")
-            
             # Read audio data
-            if os.path.exists(temp_path):
-                with open(temp_path, 'rb') as f:
-                    audio_data = f.read()
-                
-                # Clean up
-                os.unlink(temp_path)
-                
-                return audio_data
-            else:
-                raise Exception("TTS output file not created")
-                
+            with open(temp_path, 'rb') as f:
+                audio_data = f.read()
+            
+            # Clean up
+            os.unlink(temp_path)
+            
+            return audio_data
+            
         except Exception as e:
             logger.error(f"Text to speech error: {e}")
             return b""
     
     def generate_response(self, user_input: str, context: str = "") -> str:
-        """Generate conversational response - FIXED: Updated OpenAI API"""
+        """Generate conversational response"""
         try:
-            if Config.OPENAI_API_KEY:
-                # Use OpenAI if available (updated API format)
-                from openai import OpenAI
-                client = OpenAI(api_key=Config.OPENAI_API_KEY)
-                
-                response = client.chat.completions.create(
+            if self.openai_client:
+                # Use OpenAI for better responses
+                response = self.openai_client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[
-                        {"role": "system", "content": f"You are a helpful customer service agent. Context: {context}"},
+                        {"role": "system", "content": f"You are a helpful customer service agent for a tableware and home decor company. Keep responses concise and helpful. Context: {context}"},
                         {"role": "user", "content": user_input}
                     ],
                     max_tokens=150
                 )
                 return response.choices[0].message.content.strip()
-                
-            elif self.llm_pipeline:
-                # Use local LLM
-                from transformers import Conversation
-                conversation = Conversation(user_input)
-                response = self.llm_pipeline(conversation)
-                return response.generated_responses[-1]
-                
             else:
                 # Fallback to rule-based responses
                 return self._rule_based_response(user_input)
                 
         except Exception as e:
             logger.error(f"Response generation error: {e}")
-            return "I apologize, but I'm having trouble processing your request right now."
+            return "I apologize, but I'm having trouble processing your request right now. How else can I help you?"
     
     def _rule_based_response(self, user_input: str) -> str:
-        """Simple rule-based responses as fallback"""
+        """Enhanced rule-based responses for tablescapes business"""
         user_input = user_input.lower()
         
-        if any(word in user_input for word in ["hello", "hi", "hey"]):
-            return "Hello! How can I help you today?"
-        elif any(word in user_input for word in ["help", "support"]):
-            return "I'm here to help! What specific information are you looking for?"
-        elif any(word in user_input for word in ["price", "cost", "pricing"]):
-            return "Let me help you with pricing information. What specific service are you interested in?"
-        elif any(word in user_input for word in ["hours", "open", "closed"]):
-            return "Let me check our current hours for you."
+        if any(word in user_input for word in ["hello", "hi", "hey", "good morning", "good afternoon"]):
+            return "Hello! Welcome to Tablescapes. How can I help you find the perfect items for your home today?"
+        elif any(word in user_input for word in ["help", "support", "question"]):
+            return "I'm here to help! Are you looking for tableware, home decor, or do you have questions about our products?"
+        elif any(word in user_input for word in ["price", "cost", "pricing", "how much"]):
+            return "I'd be happy to help with pricing information. What specific items are you interested in?"
+        elif any(word in user_input for word in ["hours", "open", "closed", "when"]):
+            return "Let me help you with our hours and availability information."
+        elif any(word in user_input for word in ["blue", "color", "colors"]):
+            return "We have beautiful blue items! Would you like me to help you find specific blue tableware or decor pieces?"
+        elif any(word in user_input for word in ["shipping", "delivery", "ship"]):
+            return "I can help you with shipping information. What would you like to know about delivery options?"
+        elif any(word in user_input for word in ["return", "exchange", "refund"]):
+            return "I can assist you with returns and exchanges. What item would you like to return or exchange?"
         else:
-            return "I understand you're asking about that. Let me find the best person to help you with this specific question."
+            return "I understand you're asking about that. Let me connect you with someone who can provide more detailed information about our products and services."
     
     def get_embedding(self, text: str) -> List[float]:
-        """Generate embeddings for text"""
+        """Simple embedding using basic text features (fallback)"""
         try:
-            embedding = self.sentence_transformer.encode(text)
-            return embedding.tolist()
+            # Simple word-based embedding (very basic)
+            words = text.lower().split()
+            # Create a simple vector based on word length and character features
+            features = [
+                len(words),
+                sum(len(word) for word in words) / max(len(words), 1),
+                sum(1 for word in words if any(char.isdigit() for char in word)),
+                sum(1 for word in words if '?' in word or '!' in word)
+            ]
+            # Pad to make it 10-dimensional
+            while len(features) < 10:
+                features.append(0.0)
+            
+            return features[:10]  # Return first 10 features
         except Exception as e:
             logger.error(f"Embedding generation error: {e}")
-            return []
+            return [0.0] * 10  # Return zero vector
 
 class KnowledgeBaseManager:
     """Manages the learning knowledge base"""
     
-    def __init__(self, ai_engine: LocalAIEngine, db_manager):
+    def __init__(self, ai_engine: LightweightAIEngine, db_manager):
         self.ai_engine = ai_engine
         self.db_manager = db_manager
         self.knowledge_items: List[KnowledgeItem] = []
@@ -345,23 +310,25 @@ class KnowledgeBaseManager:
         logger.info(f"Added knowledge item: {question[:50]}...")
     
     def find_answer(self, question: str) -> tuple[str, float]:
-        """Find best answer for question"""
+        """Find best answer for question using simple text matching"""
         if not self.knowledge_items:
             return "", 0.0
         
-        question_embedding = self.ai_engine.get_embedding(question)
-        if not question_embedding:
-            return "", 0.0
-        
+        question_lower = question.lower()
         best_answer = ""
         best_score = 0.0
         
         for item in self.knowledge_items:
-            if not item.embedding:
-                continue
-                
-            # Calculate similarity
-            similarity = self._calculate_similarity(question_embedding, item.embedding)
+            # Simple keyword matching
+            question_words = set(question_lower.split())
+            item_words = set(item.question.lower().split())
+            
+            # Calculate word overlap score
+            common_words = question_words.intersection(item_words)
+            if len(question_words) > 0:
+                similarity = len(common_words) / len(question_words.union(item_words))
+            else:
+                similarity = 0.0
             
             if similarity > best_score and similarity > Config.SIMILARITY_THRESHOLD:
                 best_answer = item.answer
@@ -372,26 +339,6 @@ class KnowledgeBaseManager:
                 self.db_manager.save_knowledge_item(item)
         
         return best_answer, best_score
-    
-    def _calculate_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
-        """Calculate cosine similarity between embeddings"""
-        try:
-            vec1 = np.array(embedding1)
-            vec2 = np.array(embedding2)
-            
-            dot_product = np.dot(vec1, vec2)
-            norm1 = np.linalg.norm(vec1)
-            norm2 = np.linalg.norm(vec2)
-            
-            if norm1 == 0 or norm2 == 0:
-                return 0.0
-                
-            similarity = dot_product / (norm1 * norm2)
-            return float(similarity)
-            
-        except Exception as e:
-            logger.error(f"Similarity calculation error: {e}")
-            return 0.0
     
     def scrape_website_knowledge(self, website_url: str):
         """Scrape website and add to knowledge base"""
@@ -477,63 +424,35 @@ class WebScraper:
         """Extract question-answer pairs from text"""
         qa_pairs = []
         
-        # Split text into sentences
-        sentences = re.split(r'[.!?]+', text)
+        # Look for FAQ patterns and headings
+        lines = text.split('\n')
         
-        # Look for FAQ patterns
-        faq_patterns = [
-            r'(?i)(what|how|why|when|where|who|can|is|are|do|does|will|would)\s+.*\?',
-            r'(?i)q:\s*(.*?)\s*a:\s*(.*?)(?=q:|$)',
-            r'(?i)question:\s*(.*?)\s*answer:\s*(.*?)(?=question:|$)'
-        ]
-        
-        for pattern in faq_patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                if len(match.groups()) >= 2:
-                    question = match.group(1).strip()
-                    answer = match.group(2).strip()
-                else:
-                    question = match.group(0).strip()
-                    answer = self._find_answer_nearby(text, match.end())
+        for i, line in enumerate(lines):
+            line = line.strip()
+            
+            # Look for headings or questions
+            if len(line) > 10 and (
+                line.endswith('?') or 
+                any(line.lower().startswith(word) for word in ['what', 'how', 'why', 'when', 'where']) or
+                line.isupper() or
+                (len(line.split()) < 10 and ':' not in line)
+            ):
+                # Find the next few lines as potential answer
+                answer_lines = []
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    if j < len(lines) and lines[j].strip():
+                        answer_lines.append(lines[j].strip())
                 
-                if len(question) > 10 and len(answer) > 10:
-                    qa_pairs.append({
-                        "question": question,
-                        "answer": answer,
-                        "source": source_url
-                    })
-        
-        # Extract headings as potential Q&A
-        headings = re.findall(r'<h[1-6][^>]*>(.*?)</h[1-6]>', text, re.IGNORECASE)
-        for heading in headings:
-            if len(heading) > 5:
-                # Find content after heading
-                heading_pos = text.find(heading)
-                if heading_pos != -1:
-                    content_after = text[heading_pos + len(heading):heading_pos + len(heading) + 500]
-                    first_sentence = re.split(r'[.!?]+', content_after)[0].strip()
-                    
-                    if len(first_sentence) > 20:
+                if answer_lines:
+                    answer = ' '.join(answer_lines)
+                    if len(answer) > 20 and len(answer) < 500:
                         qa_pairs.append({
-                            "question": f"Tell me about {heading}",
-                            "answer": first_sentence,
+                            "question": line,
+                            "answer": answer,
                             "source": source_url
                         })
         
         return qa_pairs
-    
-    def _find_answer_nearby(self, text: str, start_pos: int, max_length: int = 300) -> str:
-        """Find answer text near a question"""
-        end_pos = min(start_pos + max_length, len(text))
-        nearby_text = text[start_pos:end_pos]
-        
-        # Find first complete sentence
-        sentences = re.split(r'[.!?]+', nearby_text)
-        if sentences and len(sentences[0]) > 10:
-            return sentences[0].strip()
-        
-        return nearby_text.strip()
 
 class DatabaseManager:
     """Database management for persistence"""
@@ -583,18 +502,6 @@ class DatabaseManager:
                 timestamp TEXT,
                 resolved BOOLEAN DEFAULT FALSE,
                 suggested_answer TEXT
-            )
-        """)
-        
-        # Analytics table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS analytics (
-                date TEXT PRIMARY KEY,
-                total_calls INTEGER,
-                answered_calls INTEGER,
-                transferred_calls INTEGER,
-                avg_confidence REAL,
-                unknown_questions INTEGER
             )
         """)
         
@@ -746,11 +653,11 @@ class DatabaseManager:
 
 # Initialize global components
 db_manager = DatabaseManager(Config.DATABASE_PATH)
-ai_engine = LocalAIEngine()
+ai_engine = LightweightAIEngine()
 knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
 
 # FastAPI application
-app = FastAPI(title="Self-Sufficient AI Voice Agent", version="1.0.0")
+app = FastAPI(title="AI Voice Agent System", version="1.0.0")
 
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -846,7 +753,7 @@ async def voice_websocket(websocket: WebSocket):
                 await websocket.send_json({
                     "type": "response",
                     "text": response_text,
-                    "audio": base64.b64encode(audio_response).decode(),
+                    "audio": base64.b64encode(audio_response).decode() if audio_response else "",
                     "confidence": confidence
                 })
                 
@@ -928,14 +835,18 @@ async def send_sms(request: Request):
     """Send SMS (mock implementation for local system)"""
     data = await request.json()
     
-    # In a real implementation, this would integrate with local SMS gateway
-    # For now, we'll log the SMS
+    # In a real implementation, this would integrate with Twilio
     logger.info(f"SMS would be sent to {data['phone']}: {data['message']}")
     
     return {"status": "success", "message": "SMS sent (simulated)"}
 
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "AI Voice Agent"}
+
 if __name__ == "__main__":
-    logger.info("Starting Self-Sufficient AI Voice Agent System")
+    logger.info("Starting AI Voice Agent System (Lightweight Version)")
     logger.info(f"Dashboard will be available at http://localhost:{Config.PORT}")
     logger.info(f"Voice interface at http://localhost:{Config.PORT}/voice-interface")
     
