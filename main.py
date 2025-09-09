@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
 Self-Sufficient AI Voice Agent System – Final Production Version
-- Fixed race conditions in audio buffering and database updates
-- Memory protection for large audio combinations
-- Enhanced rate limiting with connection tracking
-- Atomic database operations for usage counting
-- Improved error recovery and resource cleanup
+- Async-safe (aiosqlite + threadpools for blocking ops)
+- Truthful audio MIME (gTTS -> MP3)
+- Buffered WS audio with size caps and timeouts
+- Circuit breakers + retries for OpenAI calls
+- Monotonic, thread-safe rate limiting + global connection cap
+- Atomic DB updates and correct UTC date-range stats
 """
 
-from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
 import os
 import logging
 import asyncio
@@ -30,18 +29,15 @@ from pathlib import Path
 from collections import defaultdict
 
 import aiosqlite
-import httpx
-from bs4 import BeautifulSoup
-
 from starlette.concurrency import run_in_threadpool
-from starlette.middleware.cors import CORSMiddleware
 
-# Retries
+# Retries (sync callables)
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# Optional cloud LLM/STT/TTS
-from openai import OpenAI  # v1 client (sync)
+# Cloud LLM/STT/TTS (sync clients)
+from openai import OpenAI
 from gtts import gTTS
+
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -52,76 +48,56 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voice_agent")
 
+
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
 class Config:
-    # OpenAI (optional)
+    # OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
+    OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
+    # CORS
+    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",")
+    
     # App
     BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
     DATABASE_PATH = os.getenv("DATABASE_PATH", "voice_agent.db")
-    MODELS_PATH = os.getenv("MODELS_PATH", "models")
-    AUDIO_PATH = os.getenv("AUDIO_PATH", "audio")
-    TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", "templates")
-    STATIC_DIR = os.getenv("STATIC_DIR", "static")
 
-    # Audio (with memory protection)
+    # Audio
     SAMPLE_RATE = 16000
-    AUDIO_TTS_MIME = "audio/mpeg"  # gTTS returns MP3
     STT_TARGET_RATE = 16000
-    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "5242880"))  # 5MB per frame (reduced)
-    MAX_COMBINED_AUDIO = int(os.getenv("MAX_COMBINED_AUDIO", "15728640"))  # 15MB total
-    AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "3"))  # Chunks to buffer
+    AUDIO_TTS_MIME = "audio/mpeg"  # gTTS -> MP3
+    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "5242880"))       # 5 MB per frame
+    MAX_COMBINED_AUDIO = int(os.getenv("MAX_COMBINED_AUDIO", "15728640"))  # 15 MB per batch
+    AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "3"))       # frames per STT batch
 
     # KB / matching
     SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.30"))
     CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
 
     # Call control
-    MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "600"))  # seconds
-    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "10"))  # seconds
+    MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "600"))     # seconds
+    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "10"))      # seconds
 
     # Server
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "8000"))
 
-    # Security
-    API_KEY = os.getenv("VOICE_AGENT_API_KEY")  # if set, required for /api/*
-    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
-    MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "4000"))
+    # Rate limiting / connections
+    MAX_CONCURRENT_CONNECTIONS = int(os.getenv("MAX_CONCURRENT_CONNECTIONS", "10"))  # global cap
+    RATE_LIMIT_CONNECTIONS = int(os.getenv("RATE_LIMIT_CONNECTIONS", "3"))           # per-IP/window
+    RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "300"))                   # seconds
 
-    # Rate limiting (more conservative for production)
-    MAX_CONCURRENT_CONNECTIONS = int(os.getenv("MAX_CONCURRENT_CONNECTIONS", "10"))  # Global limit
-    RATE_LIMIT_CONNECTIONS = int(os.getenv("RATE_LIMIT_CONNECTIONS", "3"))  # Per IP
-    RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "300"))  # 5 minutes
-    
-    # Circuit breaker settings
+    # Circuit breaker
     CB_FAIL_THRESHOLD = int(os.getenv("CB_FAIL_THRESHOLD", "3"))
     CB_RESET_TIMEOUT = int(os.getenv("CB_RESET_TIMEOUT", "30"))
     CB_HALF_OPEN_LIMIT = int(os.getenv("CB_HALF_OPEN_LIMIT", "2"))
 
-    # Scraper safety
-    ALLOWED_SCRAPE_HOSTS = set(
-        h.strip().lower()
-        for h in os.getenv(
-            "ALLOWED_SCRAPE_HOSTS", "tablescapes.com,www.tablescapes.com"
-        ).split(",")
-        if h.strip()
-    )
+    # Misc
+    MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "4000"))
 
-    # Routing keywords
-    ROUTE_TO_HUMAN_KEYWORDS = [
-        "human", "person", "agent", "representative",
-        "manager", "supervisor", "help me", "speak to someone"
-    ]
-
-# Ensure dirs
-os.makedirs(Config.MODELS_PATH, exist_ok=True)
-os.makedirs(Config.AUDIO_PATH, exist_ok=True)
-os.makedirs(Config.TEMPLATE_DIR, exist_ok=True)
-os.makedirs(Config.STATIC_DIR, exist_ok=True)
 
 # ------------------------------------------------------------------------------
 # Data models
@@ -129,13 +105,14 @@ os.makedirs(Config.STATIC_DIR, exist_ok=True)
 @dataclass
 class Call:
     call_id: str
-    caller_info: str  # phone/browser/local
+    caller_info: str
     start_time: datetime
     end_time: Optional[datetime] = None
     transcript: str = ""
-    outcome: str = ""  # answered, transferred, failed
+    outcome: str = ""     # answered, transferred, failed
     confidence_score: float = 0.0
     audio_file: Optional[str] = None
+
 
 @dataclass
 class KnowledgeItem:
@@ -147,6 +124,7 @@ class KnowledgeItem:
     last_updated: Optional[datetime] = None
     usage_count: int = 0
 
+
 @dataclass
 class UnknownQuestion:
     id: str
@@ -156,19 +134,23 @@ class UnknownQuestion:
     resolved: bool = False
     suggested_answer: Optional[str] = None
 
+
 # ------------------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def today_utc_range() -> Tuple[str, str]:
     start = datetime.now(timezone.utc).date()
     end = start + timedelta(days=1)
     return start.isoformat(), end.isoformat()
 
+
 def limit_len(s: str, maxlen: int) -> str:
     return s if len(s) <= maxlen else s[:maxlen]
+
 
 def ffmpeg_available() -> bool:
     try:
@@ -182,108 +164,97 @@ def ffmpeg_available() -> bool:
     except Exception:
         return False
 
+
 # ------------------------------------------------------------------------------
-# Connection Tracking (Global)
+# Connection tracking + rate limiting (thread-safe)
 # ------------------------------------------------------------------------------
 class ConnectionTracker:
     def __init__(self, max_connections: int = 10):
         self.max_connections = max_connections
-        self.active_connections = set()
+        self.active = set()
         self.lock = threading.Lock()
-    
-    def add_connection(self, conn_id: str) -> bool:
-        with self.lock:
-            if len(self.active_connections) >= self.max_connections:
-                return False
-            self.active_connections.add(conn_id)
-            return True
-    
-    def remove_connection(self, conn_id: str):
-        with self.lock:
-            self.active_connections.discard(conn_id)
-    
-    def get_count(self) -> int:
-        with self.lock:
-            return len(self.active_connections)
 
-# Global connection tracker
+    def add(self, conn_id: str) -> bool:
+        with self.lock:
+            if len(self.active) >= self.max_connections:
+                return False
+            self.active.add(conn_id)
+            return True
+
+    def remove(self, conn_id: str):
+        with self.lock:
+            self.active.discard(conn_id)
+
+    def count(self) -> int:
+        with self.lock:
+            return len(self.active)
+
+
 connection_tracker = ConnectionTracker(Config.MAX_CONCURRENT_CONNECTIONS)
 
-# ------------------------------------------------------------------------------
-# Enhanced Rate Limiter (Thread-safe)
-# ------------------------------------------------------------------------------
+
 class RateLimiter:
+    """Per-client token-like limiter: max 'connections' within window."""
     def __init__(self, max_connections: int = 3, window_seconds: int = 300, max_clients: int = 1000):
         self.max_connections = max_connections
         self.window = window_seconds
         self.max_clients = max_clients
-        self.connections = defaultdict(list)
+        self.connections = defaultdict(list)   # client_id -> [timestamps]
         self.lock = threading.Lock()
         self.last_cleanup = time.monotonic()
         self.cleanup_interval = 300
 
     def is_allowed(self, client_id: str) -> bool:
         now = time.monotonic()
-        
         with self.lock:
-            # Periodic cleanup
             if now - self.last_cleanup > self.cleanup_interval:
-                self._cleanup_old_entries(now)
+                self._cleanup(now)
                 self.last_cleanup = now
 
             win_start = now - self.window
-            connections = self.connections[client_id]
-            
-            # Remove old connections
-            self.connections[client_id] = [ts for ts in connections if ts > win_start]
-            connections = self.connections[client_id]
+            lst = self.connections[client_id]
+            self.connections[client_id] = [t for t in lst if t > win_start]
+            lst = self.connections[client_id]
 
-            if len(connections) < self.max_connections:
-                connections.append(now)
+            if len(lst) < self.max_connections:
+                lst.append(now)
                 return True
             return False
 
-    def _cleanup_old_entries(self, now: float):
-        """Remove inactive clients (called with lock held)"""
-        win_start = now - self.window * 2
-        clients_to_remove = []
-        
-        for client_id, timestamps in self.connections.items():
-            if not timestamps or timestamps[-1] < win_start:
-                clients_to_remove.append(client_id)
-        
-        for client_id in clients_to_remove:
-            del self.connections[client_id]
-        
-        # Emergency cleanup
+    def _cleanup(self, now: float):
+        cutoff = now - self.window * 2
+        to_del = [cid for cid, ts in self.connections.items() if not ts or ts[-1] < cutoff]
+        for cid in to_del:
+            del self.connections[cid]
         if len(self.connections) > self.max_clients:
-            sorted_clients = sorted(
-                self.connections.items(), 
-                key=lambda x: x[1][-1] if x[1] else 0
-            )
-            clients_to_remove = sorted_clients[:len(self.connections) - self.max_clients]
-            for client_id, _ in clients_to_remove:
-                del self.connections[client_id]
+            # drop oldest
+            items = sorted(self.connections.items(), key=lambda kv: kv[1][-1] if kv[1] else 0)
+            for cid, _ in items[:len(self.connections) - self.max_clients]:
+                del self.connections[cid]
 
-    def get_stats(self) -> Dict[str, Any]:
+    def stats(self) -> Dict[str, Any]:
         with self.lock:
             return {
                 "active_clients": len(self.connections),
-                "total_connections": sum(len(timestamps) for timestamps in self.connections.values()),
+                "total_marks": sum(len(v) for v in self.connections.values()),
                 "window_seconds": self.window,
                 "max_connections_per_window": self.max_connections
             }
 
+
+rate_limiter = RateLimiter(Config.RATE_LIMIT_CONNECTIONS, Config.RATE_LIMIT_WINDOW)
+
+
 # ------------------------------------------------------------------------------
-# Enhanced Circuit Breaker (Fixed state transitions)
+# Circuit Breaker
 # ------------------------------------------------------------------------------
 class CircuitBreaker:
     def __init__(self, fail_threshold: int = 3, reset_timeout: int = 30, half_open_limit: int = 2):
         self.fail_threshold = fail_threshold
         self.reset_timeout = reset_timeout
         self.half_open_limit = half_open_limit
-        
-        self.state = "closed"
+
+        self.state = "closed"  # closed, open, half-open
         self.failure_count = 0
         self.success_count = 0
         self.opened_at: Optional[float] = None
@@ -294,21 +265,21 @@ class CircuitBreaker:
         with self.lock:
             if self.state == "closed":
                 return True
-            elif self.state == "open":
+            if self.state == "open":
                 if self.opened_at is None:
                     return False
                 if time.monotonic() - self.opened_at >= self.reset_timeout:
                     self.state = "half-open"
                     self.half_open_calls = 0
                     self.success_count = 0
-                    logger.info("Circuit breaker transitioning to half-open state")
+                    logger.info("Circuit -> half-open")
                     return True
                 return False
-            elif self.state == "half-open":
-                can_proceed = self.half_open_calls < self.half_open_limit
-                if can_proceed:
+            if self.state == "half-open":
+                if self.half_open_calls < self.half_open_limit:
                     self.half_open_calls += 1
-                return can_proceed
+                    return True
+                return False
             return False
 
     def record_success(self):
@@ -321,7 +292,7 @@ class CircuitBreaker:
                     self.opened_at = None
                     self.half_open_calls = 0
                     self.success_count = 0
-                    logger.info("Circuit breaker recovered to closed state")
+                    logger.info("Circuit -> closed (recovered)")
             elif self.state == "closed":
                 self.failure_count = max(0, self.failure_count - 1)
 
@@ -332,26 +303,26 @@ class CircuitBreaker:
                 self.opened_at = time.monotonic()
                 self.half_open_calls = 0
                 self.success_count = 0
-                logger.warning("Circuit breaker failed in half-open state, returning to open")
+                logger.warning("Circuit half-open call failed -> open")
             else:
                 self.failure_count += 1
                 if self.failure_count >= self.fail_threshold:
                     self.state = "open"
                     self.opened_at = time.monotonic()
-                    logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+                    logger.warning("Circuit opened")
 
-    def get_state(self) -> Dict[str, Any]:
+    def status(self) -> Dict[str, Any]:
         with self.lock:
             return {
                 "state": self.state,
                 "failure_count": self.failure_count,
                 "success_count": self.success_count,
-                "half_open_calls": self.half_open_calls,
-                "can_call": self.state == "closed" or (self.state == "half-open" and self.half_open_calls < self.half_open_limit)
+                "half_open_calls": self.half_open_calls
             }
 
+
 # ------------------------------------------------------------------------------
-# AI Engine (Thread-safe operations)
+# AI Engine
 # ------------------------------------------------------------------------------
 class LightweightAIEngine:
     def __init__(self):
@@ -360,50 +331,33 @@ class LightweightAIEngine:
             self.openai_client = OpenAI(
                 api_key=Config.OPENAI_API_KEY,
                 timeout=30.0,
-                max_retries=0
+                max_retries=0  # tenacity handles retries
             )
-            logger.info("OpenAI client initialized with thread-safe circuit breakers.")
+            logger.info("OpenAI client initialized.")
         else:
             logger.info("No OPENAI_API_KEY set. Falling back to rule-based responses.")
-        
-        self.cb_stt = CircuitBreaker(
-            fail_threshold=Config.CB_FAIL_THRESHOLD,
-            reset_timeout=Config.CB_RESET_TIMEOUT,
-            half_open_limit=Config.CB_HALF_OPEN_LIMIT
-        )
-        self.cb_chat = CircuitBreaker(
-            fail_threshold=Config.CB_FAIL_THRESHOLD,
-            reset_timeout=Config.CB_RESET_TIMEOUT,
-            half_open_limit=Config.CB_HALF_OPEN_LIMIT
-        )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(Exception),
-        reraise=True
-    )
+        self.cb_stt = CircuitBreaker(Config.CB_FAIL_THRESHOLD, Config.CB_RESET_TIMEOUT, Config.CB_HALF_OPEN_LIMIT)
+        self.cb_chat = CircuitBreaker(Config.CB_FAIL_THRESHOLD, Config.CB_RESET_TIMEOUT, Config.CB_HALF_OPEN_LIMIT)
+
+    # Retried sync callables
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10),
+           retry=retry_if_exception_type(Exception), reraise=True)
     def _sync_openai_stt(self, file_obj, model: str):
         return self.openai_client.audio.transcriptions.create(model=model, file=file_obj)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
-        retry=retry_if_exception_type(Exception),
-        reraise=True
-    )
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10),
+           retry=retry_if_exception_type(Exception), reraise=True)
     def _sync_openai_chat(self, messages, model, temperature, max_tokens):
         return self.openai_client.chat.completions.create(
-            model=model, messages=messages,
-            temperature=temperature, max_tokens=max_tokens
+            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
         )
 
     async def convert_audio_to(self, data: bytes, target_sample_rate: int = 16000) -> Tuple[bytes, str]:
-        """Convert audio with size validation"""
+        """Convert to 16kHz mono WAV using ffmpeg. Do not truncate container bytes."""
         if len(data) > Config.MAX_COMBINED_AUDIO:
-            logger.warning(f"Audio data too large for conversion: {len(data)} bytes")
-            return data[:Config.MAX_COMBINED_AUDIO], "webm"  # Truncate
-            
+            raise ValueError("audio_combination_too_large")
+
         async def _run():
             with tempfile.TemporaryDirectory() as td:
                 in_path = Path(td) / "in.webm"
@@ -423,29 +377,33 @@ class LightweightAIEngine:
         return await run_in_threadpool(_run)
 
     async def speech_to_text(self, audio_bytes: bytes) -> str:
-        """STT with memory protection and circuit breaker"""
-        if not self.openai_client or not self.cb_stt.can_call():
+        """Batch STT with circuit breaker and retries."""
+        if not self.openai_client:
             return ""
-
+        if not self.cb_stt.can_call():
+            logger.warning("STT circuit open; skipping call.")
+            return ""
         if len(audio_bytes) > Config.MAX_COMBINED_AUDIO:
-            logger.warning(f"Audio too large for STT: {len(audio_bytes)} bytes")
+            logger.warning("Audio too large for STT batch.")
             return ""
 
-        wav_bytes, fmt = await self.convert_audio_to(audio_bytes, Config.STT_TARGET_RATE)
+        try:
+            wav_bytes, fmt = await self.convert_audio_to(audio_bytes, Config.STT_TARGET_RATE)
+        except ValueError:
+            return ""
         suffix = ".wav" if fmt == "wav" else ".webm"
 
         def _transcribe_sync(path: Path, model: str) -> str:
             with path.open("rb") as f:
                 resp = self._sync_openai_stt(f, model)
-                return (resp.text or "").strip()
+                return (getattr(resp, "text", "") or "").strip()
 
         async def _transcribe():
             with tempfile.TemporaryDirectory() as td:
                 p = Path(td) / f"audio{suffix}"
                 p.write_bytes(wav_bytes)
                 try:
-                    model = os.getenv("OPENAI_STT_MODEL", "whisper-1")
-                    text = await run_in_threadpool(_transcribe_sync, p, model)
+                    text = await run_in_threadpool(_transcribe_sync, p, Config.OPENAI_STT_MODEL)
                     self.cb_stt.record_success()
                     return text
                 except Exception as e:
@@ -454,30 +412,31 @@ class LightweightAIEngine:
                     return ""
         return await _transcribe()
 
+    def _tts_sync(self, text: str) -> bytes:
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "tts.mp3"
+            gTTS(text=text, lang="en", slow=False).save(str(out))
+            return out.read_bytes()
+
     async def text_to_speech(self, text: str) -> bytes:
-        """TTS with timeout protection"""
+        """TTS via gTTS (sync) executed in a threadpool, with timeout."""
         text = limit_len(text, Config.MAX_INPUT_LEN)
-        
-        async def _tts():
-            try:
-                with tempfile.TemporaryDirectory() as td:
-                    out = Path(td) / "tts.mp3"
-                    gTTS(text=text, lang="en", slow=False).save(str(out))
-                    return out.read_bytes()
-            except Exception as e:
-                logger.error(f"TTS error: {e}")
-                return b""
-        
         try:
-            return await asyncio.wait_for(_tts(), timeout=30.0)
+            return await asyncio.wait_for(
+                run_in_threadpool(self._tts_sync, text),
+                timeout=30.0
+            )
         except asyncio.TimeoutError:
-            logger.error("TTS operation timed out")
+            logger.error("TTS timeout")
+            return b""
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
             return b""
 
     async def generate_response(self, user_input: str, context: str = "") -> str:
-        """LLM response with circuit breaker"""
+        """LLM response or rule-based fallback, guarded by circuit breaker."""
         user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
-        
+
         if self.openai_client and self.cb_chat.can_call():
             try:
                 resp = await run_in_threadpool(
@@ -487,7 +446,7 @@ class LightweightAIEngine:
                          "content": f"You are a concise customer service agent for a tableware and event-rental business. Keep answers accurate and succinct. Context: {context}"},
                         {"role": "user", "content": user_input}
                     ],
-                    os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+                    Config.OPENAI_CHAT_MODEL,
                     0.2,
                     220
                 )
@@ -510,7 +469,7 @@ class LightweightAIEngine:
         if any(w in u for w in ["price", "cost", "pricing", "how much"]):
             return "Which item do you want pricing for?"
         if any(w in u for w in ["hours", "open", "closed"]):
-            return "Tell me which location and I'll check hours."
+            return "Tell me which location and I’ll check hours."
         if any(w in u for w in ["shipping", "delivery", "ship"]):
             return "What would you like to know about delivery options?"
         if any(w in u for w in ["return", "exchange", "refund"]):
@@ -529,14 +488,12 @@ class LightweightAIEngine:
             features.append(0.0)
         return features[:10]
 
-    def get_circuit_breaker_status(self) -> Dict[str, Any]:
-        return {
-            "stt": self.cb_stt.get_state(),
-            "chat": self.cb_chat.get_state()
-        }
+    def breakers_status(self) -> Dict[str, Any]:
+        return {"stt": self.cb_stt.status(), "chat": self.cb_chat.status()}
+
 
 # ------------------------------------------------------------------------------
-# Database (with atomic operations)
+# Database (aiosqlite)
 # ------------------------------------------------------------------------------
 class DatabaseManager:
     def __init__(self, db_path: str):
@@ -579,12 +536,6 @@ class DatabaseManager:
                     suggested_answer TEXT
                 )
             """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
             await conn.commit()
 
     async def save_call(self, call: Call):
@@ -618,12 +569,8 @@ class DatabaseManager:
             await conn.commit()
 
     async def increment_usage_count(self, item_id: str):
-        """Atomic usage count increment"""
         async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute(
-                "UPDATE knowledge_base SET usage_count = usage_count + 1 WHERE id = ?", 
-                (item_id,)
-            )
+            await conn.execute("UPDATE knowledge_base SET usage_count = usage_count + 1 WHERE id = ?", (item_id,))
             await conn.commit()
 
     async def save_unknown_question(self, q: UnknownQuestion):
@@ -633,8 +580,7 @@ class DatabaseManager:
                 (id, question, call_id, timestamp, resolved, suggested_answer)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                q.id, q.question, q.call_id, q.timestamp.isoformat(),
-                int(q.resolved), q.suggested_answer
+                q.id, q.question, q.call_id, q.timestamp.isoformat(), int(q.resolved), q.suggested_answer
             ))
             await conn.commit()
 
@@ -661,8 +607,7 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(
-                "SELECT * FROM unknown_questions WHERE resolved = ? ORDER BY timestamp DESC", 
-                (int(resolved),)
+                "SELECT * FROM unknown_questions WHERE resolved = ? ORDER BY timestamp DESC", (int(resolved),)
             ) as cur:
                 rows = await cur.fetchall()
         out: List[UnknownQuestion] = []
@@ -705,8 +650,9 @@ class DatabaseManager:
             "unknown_questions": row2["c"] or 0
         }
 
+
 # ------------------------------------------------------------------------------
-# Knowledge Manager (with atomic updates)
+# Knowledge Manager
 # ------------------------------------------------------------------------------
 class KnowledgeBaseManager:
     def __init__(self, ai_engine: LightweightAIEngine, db_manager: DatabaseManager):
@@ -733,10 +679,8 @@ class KnowledgeBaseManager:
         await self.db.save_knowledge_item(item)
 
     async def find_answer(self, question: str) -> Tuple[str, float, Optional[str]]:
-        """Returns (answer, confidence, item_id)"""
         if not self.knowledge_items:
             return "", 0.0, None
-
         q_words = set(question.lower().split())
         best: Tuple[str, float, Optional[str]] = ("", 0.0, None)
 
@@ -750,98 +694,90 @@ class KnowledgeBaseManager:
             if sim > best[1] and sim >= Config.SIMILARITY_THRESHOLD:
                 best = (it.answer, sim, it.id)
 
-        # Atomic usage count increment
-        if best[2]:  # If we found a match
+        if best[2]:
             await self.db.increment_usage_count(best[2])
+            # Database is source of truth - no local update needed
+        
+                return best
 
-        return best[0], best[1], best[2]
 
 # ------------------------------------------------------------------------------
-# Remaining classes (WebScraper, HealthChecker, etc.) stay the same...
-# [Truncated for space - these don't need changes]
+# App wiring
 # ------------------------------------------------------------------------------
-
-# Initialize components
 db_manager = DatabaseManager(Config.DATABASE_PATH)
 ai_engine = LightweightAIEngine()
 knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
-rate_limiter = RateLimiter(Config.RATE_LIMIT_CONNECTIONS, Config.RATE_LIMIT_WINDOW)
 
-app = FastAPI(title="AI Voice Agent System - Final Production", version="1.4.0")
+app = FastAPI(title="AI Voice Agent System - Final Production", version="1.5.0")
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=Config.CORS_ORIGINS if Config.CORS_ORIGINS != ["*"] else ["*"],
+    allow_origins=Config.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+@app.on_event("startup")
+async def _startup():
+    await db_manager.init_database()
+    await knowledge_manager.load()
+    if not ffmpeg_available():
+        logger.warning("ffmpeg not found; STT will fall back to WEBM input for transcription.")
+    logger.info("Startup complete.")
+
+
 # ------------------------------------------------------------------------------
-# Fixed WebSocket Handler (Race-condition free)
+# WebSocket voice endpoint
 # ------------------------------------------------------------------------------
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
     await websocket.accept()
     call_id = f"call_{uuid4().hex}"
-    
-    # Global connection limit check
-    if not connection_tracker.add_connection(call_id):
-        await websocket.send_json({
-            "type": "error", 
-            "message": "Server at maximum capacity. Please try again later."
-        })
-        await websocket.close(code=1013)  # Try again later
+
+    # Global capacity cap
+    if not connection_tracker.add(call_id):
+        await websocket.send_json({"type": "error", "message": "Server at capacity. Try again later."})
+        await websocket.close(code=1013)
         return
 
+    call_created = False
     try:
         call = Call(call_id=call_id, caller_info="websocket", start_time=now_utc())
-        logger.info(f"Call started: {call_id} (Active: {connection_tracker.get_count()})")
+        call_created = True
+        logger.info(f"Call started: {call_id} (active={connection_tracker.count()})")
 
         start_ts = time.monotonic()
-        
-        # Client identification for rate limiting
-        client_id = (
-            f"{websocket.client.host}"
-            if websocket.client else websocket.headers.get("sec-websocket-key", "unknown")
-        )
 
-        # Per-IP rate limit check
-        if not rate_limiter.is_allowed(client_id):
-            await websocket.send_json({
-                "type": "error", 
-                "message": "Rate limit exceeded for your IP. Please try again later."
-            })
+        # Per-IP limiter
+        client_ip = websocket.client.host if websocket.client else "unknown"
+        if not rate_limiter.is_allowed(client_ip):
+            await websocket.send_json({"type": "error", "message": "Rate limit exceeded for your IP."})
             await websocket.close(code=1008)
             return
 
-        # Audio processing with race condition protection
-        audio_buffer = []
+        audio_buffer: List[bytes] = []
         buffer_lock = asyncio.Lock()
         last_process_time = time.monotonic()
-        
+
         while True:
-            current_time = time.monotonic()
-            
-            # Enforce max duration
-            if current_time - start_ts > Config.MAX_CALL_DURATION:
+            # Duration limit
+            if time.monotonic() - start_ts > Config.MAX_CALL_DURATION:
                 await websocket.send_json({"type": "closing", "reason": "max_duration"})
                 await websocket.close(code=1000)
                 call.outcome = call.outcome or "answered"
                 break
 
-            # Receive audio with timeout
+            # Receive with timeout
             try:
-                data = await asyncio.wait_for(
-                    websocket.receive_bytes(), 
-                    timeout=Config.WEBSOCKET_TIMEOUT
-                )
+                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=Config.WEBSOCKET_TIMEOUT)
             except asyncio.TimeoutError:
                 await websocket.send_json({"type": "heartbeat"})
                 continue
             except Exception as e:
-                logger.warning(f"Error receiving audio: {e}")
+                logger.warning(f"Receive error ({call_id}): {e}")
                 break
 
             if not data:
@@ -849,130 +785,121 @@ async def voice_websocket(websocket: WebSocket):
                 continue
 
             if len(data) > Config.MAX_AUDIO_SIZE:
-                await websocket.send_json({
-                    "type": "error", 
-                    "message": "Audio frame too large"
-                })
+                await websocket.send_json({"type": "error", "message": "audio_frame_too_large"})
                 continue
 
-            # Thread-safe audio buffering
+            # Buffer frames safely
             async with buffer_lock:
                 audio_buffer.append(data)
                 should_process = (
-                    len(audio_buffer) >= Config.AUDIO_BUFFER_SIZE or 
-                    current_time - last_process_time > 2.0
+                    len(audio_buffer) >= Config.AUDIO_BUFFER_SIZE or
+                    (time.monotonic() - last_process_time) > 2.0
                 )
-                
                 if should_process:
-                    # Create copy and clear buffer atomically
-                    processing_buffer = audio_buffer.copy()
+                    batch = b"".join(audio_buffer)
                     audio_buffer.clear()
-                    last_process_time = current_time
+                    last_process_time = time.monotonic()
                 else:
-                    processing_buffer = None
+                    batch = None
 
-            # Process audio outside of lock
-            if processing_buffer:
-                # Check combined size before processing
-                combined_size = sum(len(chunk) for chunk in processing_buffer)
-                if combined_size > Config.MAX_COMBINED_AUDIO:
-                    logger.warning(f"Combined audio too large: {combined_size} bytes")
-                    await websocket.send_json({
-                        "type": "error", 
-                        "message": "Audio combination too large"
-                    })
-                    continue
+            if not batch:
+                continue
 
-                combined_audio = b''.join(processing_buffer)
-                
-                # STT with circuit breaker protection
-                text = await ai_engine.speech_to_text(combined_audio)
-                if not text:
-                    await websocket.send_json({"type": "listening"})
-                    continue
+            # Combined size check (prevents truncation in converter)
+            if len(batch) > Config.MAX_COMBINED_AUDIO:
+                await websocket.send_json({"type": "error", "message": "audio_combination_too_large"})
+                continue
 
-                call.transcript += f"User: {text}\n"
+            # STT
+            text = await ai_engine.speech_to_text(batch)
+            if not text:
+                await websocket.send_json({"type": "listening"})
+                continue
 
-                # Knowledge base lookup
-                answer, confidence, item_id = await knowledge_manager.find_answer(text)
+            call.transcript += f"User: {text}\n"
 
-                if confidence >= Config.CONFIDENCE_THRESHOLD:
-                    response_text = answer
-                    call.outcome = call.outcome or "answered"
-                else:
-                    # Check for human transfer intent
-                    if any(k in text.lower() for k in Config.ROUTE_TO_HUMAN_KEYWORDS):
-                        msg = "Transferring you to a human agent."
-                        await websocket.send_json({"type": "transfer", "message": msg})
-                        await websocket.send_json({"type": "closing", "reason": "transfer"})
-                        await websocket.close(code=1000)
-                        call.outcome = "transferred"
-                        break
-                    
-                    # Generate AI response
-                    response_text = await ai_engine.generate_response(text)
-                    
-                    # Record unknown question
-                    uq = UnknownQuestion(
-                        id=f"unknown_{uuid4().hex}",
-                        question=text,
-                        call_id=call_id,
-                        timestamp=now_utc(),
-                        suggested_answer=response_text
-                    )
-                    await db_manager.save_unknown_question(uq)
+            # KB lookup
+            answer, confidence, item_id = await knowledge_manager.find_answer(text)
 
-                call.transcript += f"Agent: {response_text}\n"
-                call.confidence_score = confidence
+            if confidence >= Config.CONFIDENCE_THRESHOLD:
+                response_text = answer
+                call.outcome = call.outcome or "answered"
+            else:
+                # human escalation?
+                if any(k in text.lower() for k in ["human", "person", "agent", "representative", "manager", "supervisor", "help me", "speak to someone"]):
+                    await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
+                    await websocket.send_json({"type": "closing", "reason": "transfer"})
+                    await websocket.close(code=1000)
+                    call.outcome = "transferred"
+                    break
 
-                # TTS with error handling
-                try:
-                    audio_bytes = await ai_engine.text_to_speech(response_text)
-                except Exception as e:
-                    logger.error(f"TTS error: {e}")
-                    audio_bytes = b""
+                # LLM response
+                response_text = await ai_engine.generate_response(text)
 
-                await websocket.send_json({
-                    "type": "response",
-                    "text": response_text,
-                    "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
-                    "audio_mime": Config.AUDIO_TTS_MIME,
-                    "confidence": confidence
-                })
+                # Record unknown for later curation
+                uq = UnknownQuestion(
+                    id=f"unknown_{uuid4().hex}",
+                    question=text,
+                    call_id=call_id,
+                    timestamp=now_utc(),
+                    suggested_answer=response_text
+                )
+                await db_manager.save_unknown_question(uq)
+
+            call.transcript += f"Agent: {response_text}\n"
+            call.confidence_score = confidence
+
+            # TTS
+            audio_bytes = await ai_engine.text_to_speech(response_text)
+
+            await websocket.send_json({
+                "type": "response",
+                "text": response_text,
+                "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
+                "audio_mime": Config.AUDIO_TTS_MIME,
+                "confidence": confidence
+            })
 
     except WebSocketDisconnect:
         logger.info(f"Call disconnected: {call_id}")
     except Exception as e:
-        logger.error(f"WebSocket error in call {call_id}: {e}")
+        logger.error(f"WebSocket error ({call_id}): {e}")
         try:
-            await websocket.send_json({
-                "type": "error", 
-                "message": "Internal server error"
-            })
-        except:
+            await websocket.send_json({"type": "error", "message": "internal_error"})
+        except Exception:
             pass
     finally:
-        connection_tracker.remove_connection(call_id)
-        call.end_time = now_utc()
-        await db_manager.save_call(call)
-        logger.info(f"Call ended: {call_id} (Active: {connection_tracker.get_count()})")
+        connection_tracker.remove(call_id)
+        if call_created:
+            try:
+                call.end_time = now_utc()
+                await db_manager.save_call(call)
+            except Exception as e:
+                logger.error(f"Failed to persist call {call_id}: {e}")
+        logger.info(f"Call ended: {call_id} (active={connection_tracker.count()})")
+
 
 # ------------------------------------------------------------------------------
-# Basic routes and API endpoints (same as before)
+# Minimal health/stats endpoint
 # ------------------------------------------------------------------------------
 @app.get("/health")
-async def health_check():
+async def health():
+    stats = await db_manager.get_call_statistics()
     return {
         "status": "healthy",
-        "active_connections": connection_tracker.get_count(),
-        "max_connections": Config.MAX_CONCURRENT_CONNECTIONS,
-        "circuit_breakers": ai_engine.get_circuit_breaker_status(),
-        "rate_limiter": rate_limiter.get_stats()
+        "time": now_utc().isoformat(),
+        "active_connections": connection_tracker.count(),
+        "rate_limiter": rate_limiter.stats(),
+        "circuit_breakers": ai_engine.breakers_status(),
+        "stats_today": stats
     }
 
+
+# ------------------------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
     logger.info("Starting AI Voice Agent System (Final Production Version)")
-    logger.info(f"Max concurrent connections: {Config.MAX_CONCURRENT_CONNECTIONS}")
-    logger.info(f"Rate limit per IP: {Config.RATE_LIMIT_CONNECTIONS} connections per {Config.RATE_LIMIT_WINDOW}s")
-    logger.info(f"Max audio size: {Config.MAX_AUDIO_SIZE / 1024 / 1024:.1f}MB per frame")
+    logger.info(f"Dashboard: {Config.BASE_URL}")
+    logger.info(f"WS:       {Config.BASE_URL.replace('http', 'ws')}/ws/voice")
     uvicorn.run(app, host=Config.HOST, port=Config.PORT, log_level="info")
