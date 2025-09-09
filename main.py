@@ -1,99 +1,106 @@
 #!/usr/bin/env python3
 """
-Self-Sufficient AI Voice Agent System - Lightweight Version
-Uses cloud APIs for speech processing to reduce deployment size
+Self-Sufficient AI Voice Agent System - Lightweight Version (refactored)
+- Async-safe (aiosqlite/httpx)
+- Truthful audio formats & MIME
+- Safer scraping (allowlist)
+- Correct date stats
+- Basic API key auth and input limits
 """
 
-from fastapi import FastAPI, Request, Response, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+
 import uvicorn
 import os
-import json
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
 import asyncio
-import aiohttp
-from urllib.parse import urljoin
-import sqlite3
-from contextlib import asynccontextmanager
-import hashlib
-import re
-from dataclasses import dataclass, asdict
-import requests
-from bs4 import BeautifulSoup
-import numpy as np
-import pickle
-import threading
-import time
 import base64
-import wave
-import io
-import subprocess
 import tempfile
-import websockets
-import ssl
+import subprocess
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass, asdict
+from uuid import uuid4
 from pathlib import Path
-import queue
 
-# Lightweight AI imports
-import speech_recognition as sr
+import aiosqlite
+import httpx
+from bs4 import BeautifulSoup
+
+from starlette.concurrency import run_in_threadpool
+from starlette.middleware.cors import CORSMiddleware
+
+# Optional cloud LLM/STT/TTS
+from openai import OpenAI  # v1 client
 from gtts import gTTS
-import openai
 
-# Configure logging
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("voice_agent")
 
-# Configuration
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
 class Config:
-    # Cloud AI Services (lighter than local models)
-    SPEECH_RECOGNITION_SERVICE = "google"  # Uses Google's free API
-    TTS_SERVICE = "gtts"  # Google Text-to-Speech
-    
-    # OpenAI for conversations (optional but recommended)
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
-    
-    # Application settings
+    # OpenAI (optional)
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+    # App
     BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-    DATABASE_PATH = "voice_agent.db"
-    KNOWLEDGE_BASE_PATH = "knowledge_base.pkl"
-    MODELS_PATH = "models"
-    AUDIO_PATH = "audio"
-    
-    # Voice settings
+    DATABASE_PATH = os.getenv("DATABASE_PATH", "voice_agent.db")
+    MODELS_PATH = os.getenv("MODELS_PATH", "models")
+    AUDIO_PATH = os.getenv("AUDIO_PATH", "audio")
+    TEMPLATE_DIR = os.getenv("TEMPLATE_DIR", "templates")
+    STATIC_DIR = os.getenv("STATIC_DIR", "static")
+
+    # Audio
     SAMPLE_RATE = 16000
-    CHUNK_SIZE = 1024
-    AUDIO_FORMAT = "wav"
-    
-    # Learning settings
-    SIMILARITY_THRESHOLD = 0.7
-    MAX_CALL_DURATION = 600  # 10 minutes
-    CONFIDENCE_THRESHOLD = 0.6
-    
-    # Server settings
-    HOST = "0.0.0.0"
-    PORT = int(os.getenv("PORT", 8000))
-    
-    # WebRTC settings
-    WEBRTC_PORT = 8001
-    SIP_PORT = 5060
-    
+    AUDIO_TTS_MIME = "audio/mpeg"  # gTTS returns MP3
+    STT_TARGET_RATE = 16000
+
+    # KB / matching
+    SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.30"))
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
+
+    # Call control
+    MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "600"))  # seconds
+
+    # Server
+    HOST = os.getenv("HOST", "0.0.0.0")
+    PORT = int(os.getenv("PORT", "8000"))
+
+    # Security
+    API_KEY = os.getenv("VOICE_AGENT_API_KEY")  # if set, required for /api/*
+    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+    MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "4000"))
+
+    # Scraper safety
+    ALLOWED_SCRAPE_HOSTS = set(
+        h.strip().lower()
+        for h in os.getenv("ALLOWED_SCRAPE_HOSTS", "tablescapes.com,www.tablescapes.com").split(",")
+        if h.strip()
+    )
+
     # Routing keywords
     ROUTE_TO_HUMAN_KEYWORDS = [
-        "human", "person", "agent", "representative", 
+        "human", "person", "agent", "representative",
         "manager", "supervisor", "help me", "speak to someone"
     ]
 
-# Ensure directories exist
+# Ensure dirs
 os.makedirs(Config.MODELS_PATH, exist_ok=True)
 os.makedirs(Config.AUDIO_PATH, exist_ok=True)
-os.makedirs("templates", exist_ok=True)
-os.makedirs("static", exist_ok=True)
+os.makedirs(Config.TEMPLATE_DIR, exist_ok=True)
+os.makedirs(Config.STATIC_DIR, exist_ok=True)
 
+# ------------------------------------------------------------------------------
 # Data models
+# ------------------------------------------------------------------------------
 @dataclass
 class Call:
     call_id: str
@@ -112,7 +119,7 @@ class KnowledgeItem:
     answer: str
     source: str
     embedding: Optional[List[float]] = None
-    last_updated: datetime = None
+    last_updated: Optional[datetime] = None
     usage_count: int = 0
 
 @dataclass
@@ -124,766 +131,653 @@ class UnknownQuestion:
     resolved: bool = False
     suggested_answer: Optional[str] = None
 
+# ------------------------------------------------------------------------------
+# Utils
+# ------------------------------------------------------------------------------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def today_utc_range() -> Tuple[str, str]:
+    # ISO date boundaries in UTC
+    start = datetime.now(timezone.utc).date()
+    end = start + timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+def limit_len(s: str, maxlen: int) -> str:
+    return s if len(s) <= maxlen else s[:maxlen]
+
+# ------------------------------------------------------------------------------
+# AI Engine
+# ------------------------------------------------------------------------------
 class LightweightAIEngine:
-    """Lightweight AI engine using cloud services"""
-    
     def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.openai_client = None
+        self.openai_client: Optional[OpenAI] = None
         if Config.OPENAI_API_KEY:
-            self.openai_client = openai.OpenAI(api_key=Config.OPENAI_API_KEY)
-        self._initialize_services()
-    
-    def _initialize_services(self):
-        """Initialize speech recognition and other services"""
-        logger.info("Initializing lightweight AI services...")
-        
-        try:
-            # Configure speech recognition
-            self.recognizer.energy_threshold = 300
-            self.recognizer.dynamic_energy_threshold = True
-            self.recognizer.pause_threshold = 0.8
-            
-            if Config.OPENAI_API_KEY:
-                logger.info("OpenAI API key found - will use GPT for conversations")
-            else:
-                logger.info("No OpenAI API key - will use rule-based responses")
-            
-            logger.info("Lightweight AI services initialized successfully!")
-            
-        except Exception as e:
-            logger.error(f"Error initializing AI services: {e}")
-            raise
-    def convert_webm_to_wav(self, webm_data: bytes) -> bytes:
-        """Convert WebM audio to WAV format"""
-        try:
-            # Save WebM data to temp file
-            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as webm_file:
-                webm_file.write(webm_data)
-                webm_path = webm_file.name
-            
-            # Convert to WAV using ffmpeg (if available) or return original
-            wav_path = webm_path.replace('.webm', '.wav')
-            
-            try:
-                subprocess.run([
-                    'ffmpeg', '-i', webm_path, '-ar', '16000', '-ac', '1', 
-                    '-f', 'wav', wav_path, '-y'
-                ], check=True, capture_output=True)
-                
-                with open(wav_path, 'rb') as f:
-                    wav_data = f.read()
-                
-                os.unlink(webm_path)
-                os.unlink(wav_path)
-                return wav_data
-                
-            except:
-                # If ffmpeg fails, return original data
-                os.unlink(webm_path)
-                return webm_data
-                
-        except Exception as e:
-            logger.error(f"Audio conversion error: {e}")
-            return webm_data
-
-
-
-    
-    def speech_to_text(self, audio_data: bytes) -> str:
-        """Convert speech to text using OpenAI Whisper"""
-        try:
-            if not self.openai_client:
-                return ""
-                
-            # Convert and save audio data to temporary file
-            converted_audio = self.convert_webm_to_wav(audio_data)
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                temp_file.write(converted_audio)
-                temp_path = temp_file.name
-            
-            # Use OpenAI Whisper API
-            with open(temp_path, 'rb') as audio_file:
-                transcript = self.openai_client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=audio_file
-                )
-                
-            # Clean up temp file
-            os.unlink(temp_path)
-            
-            text = transcript.text.strip()
-            logger.info(f"Transcribed: {text}")
-            return text
-            
-        except Exception as e:
-            logger.error(f"Speech to text error: {e}")
-            return ""
-    
-    def text_to_speech(self, text: str) -> bytes:
-        """Convert text to speech using Google Text-to-Speech"""
-        try:
-            # Create gTTS object
-            tts = gTTS(text=text, lang='en', slow=False)
-            
-            # Save to temporary file
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
-                tts.save(temp_file.name)
-                temp_path = temp_file.name
-            
-            # Read audio data
-            with open(temp_path, 'rb') as f:
-                audio_data = f.read()
-            
-            # Clean up
-            os.unlink(temp_path)
-            
-            return audio_data
-            
-        except Exception as e:
-            logger.error(f"Text to speech error: {e}")
-            return b""
-    
-    def generate_response(self, user_input: str, context: str = "") -> str:
-        """Generate conversational response"""
-        try:
-            if self.openai_client:
-                # Use OpenAI for better responses
-                response = self.openai_client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": f"You are a helpful customer service agent for a tableware and home decor company. Keep responses concise and helpful. Context: {context}"},
-                        {"role": "user", "content": user_input}
-                    ],
-                    max_tokens=150
-                )
-                return response.choices[0].message.content.strip()
-            else:
-                # Fallback to rule-based responses
-                return self._rule_based_response(user_input)
-                
-        except Exception as e:
-            logger.error(f"Response generation error: {e}")
-            return "I apologize, but I'm having trouble processing your request right now. How else can I help you?"
-    
-    def _rule_based_response(self, user_input: str) -> str:
-        """Enhanced rule-based responses for tablescapes business"""
-        user_input = user_input.lower()
-        
-        if any(word in user_input for word in ["hello", "hi", "hey", "good morning", "good afternoon"]):
-            return "Hello! Welcome to Tablescapes. How can I help you find the perfect items for your home today?"
-        elif any(word in user_input for word in ["help", "support", "question"]):
-            return "I'm here to help! Are you looking for tableware, home decor, or do you have questions about our products?"
-        elif any(word in user_input for word in ["price", "cost", "pricing", "how much"]):
-            return "I'd be happy to help with pricing information. What specific items are you interested in?"
-        elif any(word in user_input for word in ["hours", "open", "closed", "when"]):
-            return "Let me help you with our hours and availability information."
-        elif any(word in user_input for word in ["blue", "color", "colors"]):
-            return "We have beautiful blue items! Would you like me to help you find specific blue tableware or decor pieces?"
-        elif any(word in user_input for word in ["shipping", "delivery", "ship"]):
-            return "I can help you with shipping information. What would you like to know about delivery options?"
-        elif any(word in user_input for word in ["return", "exchange", "refund"]):
-            return "I can assist you with returns and exchanges. What item would you like to return or exchange?"
+            self.openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
+            logger.info("OpenAI client initialized.")
         else:
-            return "I understand you're asking about that. Let me connect you with someone who can provide more detailed information about our products and services."
-    
-    def get_embedding(self, text: str) -> List[float]:
-        """Simple embedding using basic text features (fallback)"""
-        try:
-            # Simple word-based embedding (very basic)
-            words = text.lower().split()
-            # Create a simple vector based on word length and character features
-            features = [
-                len(words),
-                sum(len(word) for word in words) / max(len(words), 1),
-                sum(1 for word in words if any(char.isdigit() for char in word)),
-                sum(1 for word in words if '?' in word or '!' in word)
-            ]
-            # Pad to make it 10-dimensional
-            while len(features) < 10:
-                features.append(0.0)
-            
-            return features[:10]  # Return first 10 features
-        except Exception as e:
-            logger.error(f"Embedding generation error: {e}")
-            return [0.0] * 10  # Return zero vector
+            logger.info("No OPENAI_API_KEY set. Falling back to rule-based responses.")
+        # nothing else to init
 
-class KnowledgeBaseManager:
-    """Manages the learning knowledge base"""
-    
-    def __init__(self, ai_engine: LightweightAIEngine, db_manager):
-        self.ai_engine = ai_engine
-        self.db_manager = db_manager
-        self.knowledge_items: List[KnowledgeItem] = []
-        self.load_knowledge_base()
-    
-    def load_knowledge_base(self):
-        """Load knowledge base from database"""
-        self.knowledge_items = self.db_manager.get_knowledge_base()
-        logger.info(f"Loaded {len(self.knowledge_items)} knowledge items")
-    
-    def add_knowledge_item(self, question: str, answer: str, source: str = "manual"):
-        """Add new knowledge item"""
-        item_id = hashlib.md5(question.encode()).hexdigest()
-        embedding = self.ai_engine.get_embedding(question)
-        
-        item = KnowledgeItem(
-            id=item_id,
-            question=question,
-            answer=answer,
-            source=source,
-            embedding=embedding,
-            last_updated=datetime.now()
-        )
-        
-        self.knowledge_items.append(item)
-        self.db_manager.save_knowledge_item(item)
-        logger.info(f"Added knowledge item: {question[:50]}...")
-    
-    def find_answer(self, question: str) -> tuple[str, float]:
-        """Find best answer for question using simple text matching"""
-        if not self.knowledge_items:
-            return "", 0.0
-        
-        question_lower = question.lower()
-        best_answer = ""
-        best_score = 0.0
-        
-        for item in self.knowledge_items:
-            # Simple keyword matching
-            question_words = set(question_lower.split())
-            item_words = set(item.question.lower().split())
-            
-            # Calculate word overlap score
-            common_words = question_words.intersection(item_words)
-            if len(question_words) > 0:
-                similarity = len(common_words) / len(question_words.union(item_words))
-            else:
-                similarity = 0.0
-            
-            if similarity > best_score and similarity > Config.SIMILARITY_THRESHOLD:
-                best_answer = item.answer
-                best_score = similarity
-                
-                # Update usage count
-                item.usage_count += 1
-                self.db_manager.save_knowledge_item(item)
-        
-        return best_answer, best_score
-    
-    def scrape_website_knowledge(self, website_url: str):
-        """Scrape website and add to knowledge base"""
-        scraper = WebScraper()
-        qa_pairs = scraper.scrape_website(website_url)
-        
-        for qa_pair in qa_pairs:
-            self.add_knowledge_item(
-                question=qa_pair["question"],
-                answer=qa_pair["answer"],
-                source=f"scraped:{website_url}"
-            )
-        
-        logger.info(f"Added {len(qa_pairs)} items from website scraping")
+    async def convert_audio_to(self, data: bytes, target_sample_rate: int = 16000) -> Tuple[bytes, str]:
+        """
+        Try converting arbitrary audio (e.g., WEBM/Opus) to WAV 16k mono using ffmpeg.
+        On failure, return original bytes and best-effort format hint 'webm'.
+        """
+        async def _run():
+            with tempfile.TemporaryDirectory() as td:
+                in_path = Path(td) / "in.webm"
+                out_path = Path(td) / "out.wav"
+                in_path.write_bytes(data)
+                try:
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                            "-i", str(in_path), "-ar", str(target_sample_rate), "-ac", "1",
+                            "-f", "wav", str(out_path), "-y"
+                        ],
+                        check=True
+                    )
+                    return out_path.read_bytes(), "wav"
+                except subprocess.CalledProcessError:
+                    # return original; tell caller it's webm
+                    return in_path.read_bytes(), "webm"
+        return await run_in_threadpool(_run)
 
-class WebScraper:
-    """Website scraping for knowledge base building"""
-    
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (compatible; AI-Voice-Agent/1.0)'
-        })
-    
-    def scrape_website(self, base_url: str, max_pages: int = 50) -> List[Dict[str, str]]:
-        """Scrape website content and extract Q&A pairs"""
-        logger.info(f"Starting website scrape of {base_url}")
-        
-        scraped_content = []
-        visited_urls = set()
-        urls_to_visit = [base_url]
-        
-        while urls_to_visit and len(visited_urls) < max_pages:
-            url = urls_to_visit.pop(0)
-            if url in visited_urls:
-                continue
-                
+    async def speech_to_text(self, audio_bytes: bytes) -> str:
+        """
+        Batch STT using OpenAI Whisper (or successor). Returns empty string on failure.
+        """
+        if not self.openai_client:
+            return ""
+
+        wav_bytes, fmt = await self.convert_audio_to(audio_bytes, Config.STT_TARGET_RATE)
+        suffix = ".wav" if fmt == "wav" else ".webm"
+
+        async def _transcribe():
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / f"audio{suffix}"
+                p.write_bytes(wav_bytes)
+                with p.open("rb") as f:
+                    try:
+                        # Prefer current small STT-capable models if available; fall back to whisper-1
+                        # Some orgs have 'gpt-4o-mini-transcribe'. If not, keep whisper-1.
+                        try_model = os.getenv("OPENAI_STT_MODEL", "whisper-1")
+                        resp = self.openai_client.audio.transcriptions.create(
+                            model=try_model, file=f
+                        )
+                        text = (resp.text or "").strip()
+                        return text
+                    except Exception as e:
+                        logger.error(f"STT error: {e}")
+                        return ""
+        return await run_in_threadpool(_transcribe)
+
+    async def text_to_speech(self, text: str) -> bytes:
+        """
+        TTS via gTTS (MP3). Wrapped in threadpool. Returns bytes or b"" on failure.
+        """
+        text = limit_len(text, Config.MAX_INPUT_LEN)
+        async def _tts():
             try:
-                response = self.session.get(url, timeout=10)
-                if response.status_code == 200:
-                    visited_urls.add(url)
-                    
-                    soup = BeautifulSoup(response.content, 'html.parser')
-                    
-                    # Extract text content
-                    text_content = self._extract_text_content(soup)
-                    
-                    # Find new links
-                    for link in soup.find_all('a', href=True):
-                        new_url = urljoin(base_url, link['href'])
-                        if new_url.startswith(base_url) and new_url not in visited_urls:
-                            urls_to_visit.append(new_url)
-                    
-                    # Extract Q&A pairs from content
-                    qa_pairs = self._extract_qa_pairs(text_content, url)
-                    scraped_content.extend(qa_pairs)
-                    
-                    logger.info(f"Scraped {url} - found {len(qa_pairs)} Q&A pairs")
-                    
+                with tempfile.TemporaryDirectory() as td:
+                    out = Path(td) / "tts.mp3"
+                    gTTS(text=text, lang="en", slow=False).save(str(out))
+                    return out.read_bytes()
             except Exception as e:
-                logger.error(f"Error scraping {url}: {e}")
-        
-        logger.info(f"Website scraping complete. Total Q&A pairs: {len(scraped_content)}")
-        return scraped_content
-    
-    def _extract_text_content(self, soup: BeautifulSoup) -> str:
-        """Extract clean text content from HTML"""
-        # Remove script and style elements
-        for script in soup(["script", "style"]):
-            script.decompose()
-        
-        # Get text
-        text = soup.get_text()
-        
-        # Clean up whitespace
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = ' '.join(chunk for chunk in chunks if chunk)
-        
-        return text
-    
-    def _extract_qa_pairs(self, text: str, source_url: str) -> List[Dict[str, str]]:
-        """Extract question-answer pairs from text"""
-        qa_pairs = []
-        
-        # Look for FAQ patterns and headings
-        lines = text.split('\n')
-        
-        for i, line in enumerate(lines):
-            line = line.strip()
-            
-            # Look for headings or questions
-            if len(line) > 10 and (
-                line.endswith('?') or 
-                any(line.lower().startswith(word) for word in ['what', 'how', 'why', 'when', 'where']) or
-                line.isupper() or
-                (len(line.split()) < 10 and ':' not in line)
-            ):
-                # Find the next few lines as potential answer
-                answer_lines = []
-                for j in range(i + 1, min(i + 4, len(lines))):
-                    if j < len(lines) and lines[j].strip():
-                        answer_lines.append(lines[j].strip())
-                
-                if answer_lines:
-                    answer = ' '.join(answer_lines)
-                    if len(answer) > 20 and len(answer) < 500:
-                        qa_pairs.append({
-                            "question": line,
-                            "answer": answer,
-                            "source": source_url
-                        })
-        
-        return qa_pairs
+                logger.error(f"TTS error: {e}")
+                return b""
+        return await run_in_threadpool(_tts)
 
+    async def generate_response(self, user_input: str, context: str = "") -> str:
+        """
+        LLM response or rule-based fallback.
+        """
+        user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
+        if self.openai_client:
+            async def _chat():
+                try:
+                    resp = self.openai_client.chat.completions.create(
+                        model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
+                        messages=[
+                            {"role": "system",
+                             "content": f"You are a concise customer service agent for a tableware and event-rental business. Keep answers accurate and succinct. Context: {context}"},
+                            {"role": "user", "content": user_input}
+                        ],
+                        temperature=0.2,
+                        max_tokens=220,
+                    )
+                    return (resp.choices[0].message.content or "").strip()
+                except Exception as e:
+                    logger.error(f"Chat error: {e}")
+                    return ""
+            text = await run_in_threadpool(_chat)
+            if text:
+                return text
+
+        # fallback
+        return self._rule_based_response(user_input)
+
+    def _rule_based_response(self, user_input: str) -> str:
+        u = (user_input or "").lower()
+        if any(w in u for w in ["hello", "hi", "hey", "good morning", "good afternoon"]):
+            return "Hello! How can I help you today?"
+        if any(w in u for w in ["help", "support", "question"]):
+            return "Sure—what do you need help with?"
+        if any(w in u for w in ["price", "cost", "pricing", "how much"]):
+            return "Which item do you want pricing for?"
+        if any(w in u for w in ["hours", "open", "closed"]):
+            return "Tell me which location and I’ll check hours."
+        if any(w in u for w in ["shipping", "delivery", "ship"]):
+            return "What would you like to know about delivery options?"
+        if any(w in u for w in ["return", "exchange", "refund"]):
+            return "Which item/order are you asking about?"
+        return "I can help with that. Could you clarify the item or topic?"
+
+    def get_embedding(self, text: str) -> List[float]:
+        """
+        Very simple hand-made 'embedding' (kept for zero-cost fallback).
+        """
+        words = text.lower().split()
+        features = [
+            float(len(words)),
+            float(sum(len(w) for w in words) / max(1, len(words))),
+            float(sum(1 for w in words if any(c.isdigit() for c in w))),
+            float(sum(1 for w in words if ('?' in w or '!' in w))),
+        ]
+        while len(features) < 10:
+            features.append(0.0)
+        return features[:10]
+
+# ------------------------------------------------------------------------------
+# Database (aiosqlite)
+# ------------------------------------------------------------------------------
 class DatabaseManager:
-    """Database management for persistence"""
-    
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.init_database()
-    
-    def init_database(self):
-        """Initialize the database with required tables"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Calls table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS calls (
-                call_id TEXT PRIMARY KEY,
-                caller_info TEXT,
-                start_time TEXT,
-                end_time TEXT,
-                transcript TEXT,
-                outcome TEXT,
-                confidence_score REAL,
-                audio_file TEXT
+
+    async def init_database(self):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("PRAGMA journal_mode=WAL;")
+            await conn.execute("PRAGMA busy_timeout=3000;")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS calls (
+                    call_id TEXT PRIMARY KEY,
+                    caller_info TEXT,
+                    start_time TEXT,
+                    end_time TEXT,
+                    transcript TEXT,
+                    outcome TEXT,
+                    confidence_score REAL,
+                    audio_file TEXT
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS knowledge_base (
+                    id TEXT PRIMARY KEY,
+                    question TEXT,
+                    answer TEXT,
+                    source TEXT,
+                    embedding BLOB,
+                    last_updated TEXT,
+                    usage_count INTEGER DEFAULT 0
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS unknown_questions (
+                    id TEXT PRIMARY KEY,
+                    question TEXT,
+                    call_id TEXT,
+                    timestamp TEXT,
+                    resolved INTEGER DEFAULT 0,
+                    suggested_answer TEXT
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            await conn.commit()
+
+    async def save_call(self, call: Call):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("""
+                INSERT OR REPLACE INTO calls
+                (call_id, caller_info, start_time, end_time, transcript, outcome, confidence_score, audio_file)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                call.call_id, call.caller_info,
+                call.start_time.isoformat() if call.start_time else None,
+                call.end_time.isoformat() if call.end_time else None,
+                call.transcript, call.outcome, call.confidence_score, call.audio_file
+            ))
+            await conn.commit()
+
+    async def save_knowledge_item(self, item: KnowledgeItem):
+        import pickle
+        blob = pickle.dumps(item.embedding) if item.embedding else None
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("""
+                INSERT OR REPLACE INTO knowledge_base
+                (id, question, answer, source, embedding, last_updated, usage_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item.id, item.question, item.answer, item.source,
+                blob,
+                item.last_updated.isoformat() if item.last_updated else None,
+                item.usage_count
+            ))
+            await conn.commit()
+
+    async def save_unknown_question(self, q: UnknownQuestion):
+        async with aiosqlite.connect(self.db_path) as conn:
+            await conn.execute("""
+                INSERT OR REPLACE INTO unknown_questions
+                (id, question, call_id, timestamp, resolved, suggested_answer)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                q.id, q.question, q.call_id, q.timestamp.isoformat(),
+                int(q.resolved), q.suggested_answer
+            ))
+            await conn.commit()
+
+    async def get_knowledge_base(self) -> List[KnowledgeItem]:
+        import pickle
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("SELECT * FROM knowledge_base") as cur:
+                rows = await cur.fetchall()
+        items: List[KnowledgeItem] = []
+        for r in rows:
+            emb = pickle.loads(r["embedding"]) if r["embedding"] else None
+            items.append(
+                KnowledgeItem(
+                    id=r["id"], question=r["question"], answer=r["answer"], source=r["source"],
+                    embedding=emb,
+                    last_updated=datetime.fromisoformat(r["last_updated"]) if r["last_updated"] else None,
+                    usage_count=r["usage_count"] or 0
+                )
             )
-        """)
-        
-        # Knowledge base table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS knowledge_base (
-                id TEXT PRIMARY KEY,
-                question TEXT,
-                answer TEXT,
-                source TEXT,
-                embedding BLOB,
-                last_updated TEXT,
-                usage_count INTEGER DEFAULT 0
-            )
-        """)
-        
-        # Unknown questions table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS unknown_questions (
-                id TEXT PRIMARY KEY,
-                question TEXT,
-                call_id TEXT,
-                timestamp TEXT,
-                resolved BOOLEAN DEFAULT FALSE,
-                suggested_answer TEXT
-            )
-        """)
-        
-        # Settings table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        
-        conn.commit()
-        conn.close()
-    
-    def save_call(self, call: Call):
-        """Save call record to database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO calls 
-            (call_id, caller_info, start_time, end_time, transcript, outcome, confidence_score, audio_file)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            call.call_id, call.caller_info,
-            call.start_time.isoformat() if call.start_time else None,
-            call.end_time.isoformat() if call.end_time else None,
-            call.transcript, call.outcome, call.confidence_score, call.audio_file
-        ))
-        
-        conn.commit()
-        conn.close()
-    
-    def save_knowledge_item(self, item: KnowledgeItem):
-        """Save knowledge item to database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        embedding_blob = pickle.dumps(item.embedding) if item.embedding else None
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO knowledge_base 
-            (id, question, answer, source, embedding, last_updated, usage_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            item.id, item.question, item.answer, item.source,
-            embedding_blob, item.last_updated.isoformat() if item.last_updated else None,
-            item.usage_count
-        ))
-        
-        conn.commit()
-        conn.close()
-    
-    def save_unknown_question(self, question: UnknownQuestion):
-        """Save unknown question to database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO unknown_questions 
-            (id, question, call_id, timestamp, resolved, suggested_answer)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            question.id, question.question, question.call_id,
-            question.timestamp.isoformat(), question.resolved, question.suggested_answer
-        ))
-        
-        conn.commit()
-        conn.close()
-    
-    def get_knowledge_base(self) -> List[KnowledgeItem]:
-        """Get all knowledge base items"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM knowledge_base")
-        rows = cursor.fetchall()
-        
-        items = []
-        for row in rows:
-            embedding = pickle.loads(row[4]) if row[4] else None
-            item = KnowledgeItem(
-                id=row[0], question=row[1], answer=row[2], source=row[3],
-                embedding=embedding,
-                last_updated=datetime.fromisoformat(row[5]) if row[5] else None,
-                usage_count=row[6] if len(row) > 6 else 0
-            )
-            items.append(item)
-        
-        conn.close()
         return items
-    
-    def get_unknown_questions(self, resolved: bool = False) -> List[UnknownQuestion]:
-        """Get unknown questions"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT * FROM unknown_questions WHERE resolved = ?", (resolved,))
-        rows = cursor.fetchall()
-        
-        questions = []
-        for row in rows:
-            question = UnknownQuestion(
-                id=row[0], question=row[1], call_id=row[2],
-                timestamp=datetime.fromisoformat(row[3]), resolved=row[4],
-                suggested_answer=row[5] if len(row) > 5 else None
+
+    async def get_unknown_questions(self, resolved: bool = False) -> List[UnknownQuestion]:
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(
+                "SELECT * FROM unknown_questions WHERE resolved = ?", (int(resolved),)
+            ) as cur:
+                rows = await cur.fetchall()
+        out: List[UnknownQuestion] = []
+        for r in rows:
+            out.append(
+                UnknownQuestion(
+                    id=r["id"], question=r["question"], call_id=r["call_id"],
+                    timestamp=datetime.fromisoformat(r["timestamp"]),
+                    resolved=bool(r["resolved"]),
+                    suggested_answer=r["suggested_answer"]
+                )
             )
-            questions.append(question)
-        
-        conn.close()
-        return questions
-    
-    def get_call_statistics(self) -> Dict[str, Any]:
-        """Get call statistics"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        # Get today's stats
-        today = datetime.now().date().isoformat()
-        
-        cursor.execute("""
-            SELECT COUNT(*) as total_calls,
-                   AVG(confidence_score) as avg_confidence,
-                   SUM(CASE WHEN outcome = 'answered' THEN 1 ELSE 0 END) as answered_calls,
-                   SUM(CASE WHEN outcome = 'transferred' THEN 1 ELSE 0 END) as transferred_calls
-            FROM calls 
-            WHERE DATE(start_time) = ?
-        """, (today,))
-        
-        stats = cursor.fetchone()
-        
-        # Get unknown questions count
-        cursor.execute("""
-            SELECT COUNT(*) FROM unknown_questions 
-            WHERE DATE(timestamp) = ? AND resolved = FALSE
-        """, (today,))
-        
-        unknown_count = cursor.fetchone()[0]
-        
-        conn.close()
-        
+        return out
+
+    async def get_call_statistics(self) -> Dict[str, Any]:
+        start_iso, end_iso = today_utc_range()
+        async with aiosqlite.connect(self.db_path) as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute("""
+                SELECT COUNT(*) AS total_calls,
+                       AVG(confidence_score) AS avg_confidence,
+                       SUM(CASE WHEN outcome='answered' THEN 1 ELSE 0 END) AS answered_calls,
+                       SUM(CASE WHEN outcome='transferred' THEN 1 ELSE 0 END) AS transferred_calls
+                FROM calls
+                WHERE start_time >= ? AND start_time < ?
+            """, (start_iso, end_iso)) as cur:
+                row = await cur.fetchone()
+
+            async with conn.execute("""
+                SELECT COUNT(*) AS c FROM unknown_questions
+                WHERE timestamp >= ? AND timestamp < ? AND resolved = 0
+            """, (start_iso, end_iso)) as cur2:
+                row2 = await cur2.fetchone()
+
         return {
-            "total_calls": stats[0] or 0,
-            "avg_confidence": stats[1] or 0.0,
-            "answered_calls": stats[2] or 0,
-            "transferred_calls": stats[3] or 0,
-            "unknown_questions": unknown_count
+            "total_calls": row["total_calls"] or 0,
+            "avg_confidence": row["avg_confidence"] or 0.0,
+            "answered_calls": row["answered_calls"] or 0,
+            "transferred_calls": row["transferred_calls"] or 0,
+            "unknown_questions": row2["c"] or 0
         }
 
-# Initialize global components
+# ------------------------------------------------------------------------------
+# Knowledge Manager
+# ------------------------------------------------------------------------------
+class KnowledgeBaseManager:
+    def __init__(self, ai_engine: LightweightAIEngine, db_manager: DatabaseManager):
+        self.ai = ai_engine
+        self.db = db_manager
+        self.knowledge_items: List[KnowledgeItem] = []
+
+    async def load(self):
+        self.knowledge_items = await self.db.get_knowledge_base()
+        logger.info(f"Loaded {len(self.knowledge_items)} knowledge items.")
+
+    async def add_knowledge_item(self, question: str, answer: str, source: str = "manual"):
+        k_id = uuid4().hex
+        emb = self.ai.get_embedding(question)
+        item = KnowledgeItem(
+            id=k_id,
+            question=limit_len(question, Config.MAX_INPUT_LEN),
+            answer=limit_len(answer, Config.MAX_INPUT_LEN),
+            source=source,
+            embedding=emb,
+            last_updated=now_utc()
+        )
+        self.knowledge_items.append(item)
+        await self.db.save_knowledge_item(item)
+
+    async def find_answer(self, question: str) -> Tuple[str, float]:
+        if not self.knowledge_items:
+            return "", 0.0
+
+        q_words = set(question.lower().split())
+        best: Tuple[str, float] = ("", 0.0)
+
+        for it in self.knowledge_items:
+            it_words = set((it.question or "").lower().split())
+            if not it_words:
+                continue
+            inter = q_words.intersection(it_words)
+            union = q_words.union(it_words)
+            sim = len(inter) / len(union) if union else 0.0
+            if sim > best[1] and sim >= Config.SIMILARITY_THRESHOLD:
+                best = (it.answer, sim)
+                it.usage_count += 1
+                await self.db.save_knowledge_item(it)
+
+        return best
+
+# ------------------------------------------------------------------------------
+# Scraper (async, newline-preserving, allowlist)
+# ------------------------------------------------------------------------------
+class WebScraper:
+    def __init__(self):
+        self.client = httpx.AsyncClient(timeout=10.0, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; AI-Voice-Agent/1.1)"
+        })
+
+    async def close(self):
+        await self.client.aclose()
+
+    async def scrape_website(self, base_url: str, max_pages: int = 50) -> List[Dict[str, str]]:
+        logger.info(f"Scraping {base_url}")
+        from urllib.parse import urlparse, urljoin
+        host = (urlparse(base_url).hostname or "").lower()
+        if host not in Config.ALLOWED_SCRAPE_HOSTS:
+            raise HTTPException(status_code=400, detail="Target host not allowed.")
+
+        visited = set()
+        queue = [base_url]
+        out: List[Dict[str, str]] = []
+
+        while queue and len(visited) < max_pages:
+            url = queue.pop(0)
+            if url in visited:
+                continue
+            try:
+                resp = await self.client.get(url)
+                if resp.status_code == 200:
+                    visited.add(url)
+                    soup = BeautifulSoup(resp.content, "html.parser")
+                    text = self._extract_text_content(soup)
+                    out.extend(self._extract_qa_pairs(text, url))
+                    # enqueue same-host links
+                    for a in soup.find_all("a", href=True):
+                        nu = urljoin(base_url, a["href"])
+                        if (urlparse(nu).hostname or "").lower() == host and nu not in visited:
+                            queue.append(nu)
+                    logger.info(f"Scraped {url} -> {len(out)} total QAs")
+            except Exception as e:
+                logger.error(f"Scrape error {url}: {e}")
+
+        return out
+
+    def _extract_text_content(self, soup: BeautifulSoup) -> str:
+        for s in soup(["script", "style", "noscript"]):
+            s.decompose()
+        # Preserve line breaks for heuristic scanning
+        return soup.get_text("\n", strip=True)
+
+    def _extract_qa_pairs(self, text: str, source_url: str) -> List[Dict[str, str]]:
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        qa: List[Dict[str, str]] = []
+        for i, line in enumerate(lines):
+            low = line.lower()
+            if len(line) > 10 and (
+                line.endswith("?") or
+                low.startswith(("what", "how", "why", "when", "where")) or
+                (line.isupper() and len(line) < 120)
+            ):
+                # take next 1-3 lines as the 'answer'
+                ans = " ".join(lines[i+1:i+4]).strip()
+                if 20 <= len(ans) <= 600:
+                    qa.append({"question": line, "answer": ans, "source": source_url})
+        return qa
+
+# ------------------------------------------------------------------------------
+# Security helpers
+# ------------------------------------------------------------------------------
+def require_api_key(request: Request):
+    if Config.API_KEY:
+        provided = request.headers.get("X-API-Key")
+        if not provided or provided != Config.API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+
+# ------------------------------------------------------------------------------
+# FastAPI app + lifespan
+# ------------------------------------------------------------------------------
 db_manager = DatabaseManager(Config.DATABASE_PATH)
 ai_engine = LightweightAIEngine()
 knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
+scraper = WebScraper()
 
-# FastAPI application
-app = FastAPI(title="AI Voice Agent System", version="1.0.0")
+app = FastAPI(title="AI Voice Agent System", version="1.1.0")
 
-# Mount static files
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=Config.CORS_ORIGINS if Config.CORS_ORIGINS != ["*"] else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Static mounts
+app.mount("/static", StaticFiles(directory=Config.STATIC_DIR), name="static")
 app.mount("/audio", StaticFiles(directory=Config.AUDIO_PATH), name="audio")
+templates = Jinja2Templates(directory=Config.TEMPLATE_DIR)
 
-# Templates
-templates = Jinja2Templates(directory="templates")
+@app.on_event("startup")
+async def _startup():
+    await db_manager.init_database()
+    await knowledge_manager.load()
+    logger.info("Startup complete.")
 
+@app.on_event("shutdown")
+async def _shutdown():
+    await scraper.close()
+    logger.info("Shutdown complete.")
+
+# ------------------------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
-    """Main dashboard"""
-    stats = db_manager.get_call_statistics()
-    unknown_questions = db_manager.get_unknown_questions(resolved=False)
-    
+    stats = await db_manager.get_call_statistics()
+    unknown = await db_manager.get_unknown_questions(resolved=False)
     return templates.TemplateResponse("dashboard.html", {
         "request": request,
         "stats": stats,
-        "unknown_questions": unknown_questions[:5]  # Show latest 5
+        "unknown_questions": [asdict(q) for q in unknown[:5]],
     })
 
 @app.get("/voice-interface", response_class=HTMLResponse)
 async def voice_interface(request: Request):
-    """Voice interface page"""
-    return templates.TemplateResponse("voice_interface.html", {
-        "request": request
-    })
+    return templates.TemplateResponse("voice_interface.html", {"request": request})
 
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
-    """WebSocket endpoint for real-time voice communication"""
     await websocket.accept()
-    
-    call_id = f"call_{int(time.time())}"
-    call = Call(
-        call_id=call_id,
-        caller_info="websocket",
-        start_time=datetime.now()
-    )
-    
-    logger.info(f"Voice call started: {call_id}")
-    
+    call_id = f"call_{uuid4().hex}"
+    call = Call(call_id=call_id, caller_info="websocket", start_time=now_utc())
+    logger.info(f"Call started: {call_id}")
+    start_ts = asyncio.get_event_loop().time()
+
     try:
         while True:
-            # Receive audio data
-            data = await websocket.receive_bytes()
-            
-            # Process speech to text
-            text = ai_engine.speech_to_text(data)
-            
-            if text:
-                call.transcript += f"User: {text}\n"
-                
-                # Find answer in knowledge base
-                answer, confidence = knowledge_manager.find_answer(text)
-                
-                if confidence > Config.CONFIDENCE_THRESHOLD:
-                    response_text = answer
-                    call.outcome = "answered"
-                else:
-                    # Check if should transfer to human
-                    if any(keyword in text.lower() for keyword in Config.ROUTE_TO_HUMAN_KEYWORDS):
-                        response_text = "Let me transfer you to a human agent who can better assist you."
-                        call.outcome = "transferred"
-                        
-                        # Send transfer signal
-                        await websocket.send_json({
-                            "type": "transfer",
-                            "message": response_text
-                        })
-                        break
-                    else:
-                        # Generate AI response
-                        response_text = ai_engine.generate_response(text)
-                        
-                        # Log as unknown question if confidence is low
-                        if confidence < Config.CONFIDENCE_THRESHOLD:
-                            unknown_q = UnknownQuestion(
-                                id=f"unknown_{int(time.time())}",
-                                question=text,
-                                call_id=call_id,
-                                timestamp=datetime.now(),
-                                suggested_answer=response_text
-                            )
-                            db_manager.save_unknown_question(unknown_q)
-                
-                call.transcript += f"Agent: {response_text}\n"
-                call.confidence_score = confidence
-                
-                # Convert response to speech
-                audio_response = ai_engine.text_to_speech(response_text)
-                
-                # Send response
-                await websocket.send_json({
-                    "type": "response",
-                    "text": response_text,
-                    "audio": base64.b64encode(audio_response).decode() if audio_response else "",
-                    "confidence": confidence
-                })
-                
-    except WebSocketDisconnect:
-        logger.info(f"Voice call ended: {call_id}")
-    except Exception as e:
-        logger.error(f"Voice call error: {e}")
-    finally:
-        call.end_time = datetime.now()
-        db_manager.save_call(call)
+            # Enforce max duration
+            if asyncio.get_event_loop().time() - start_ts > Config.MAX_CALL_DURATION:
+                await websocket.send_json({"type": "closing", "reason": "max_duration"})
+                await websocket.close(code=1000)
+                call.outcome = call.outcome or "answered"
+                break
 
+            # Receive next audio frame (bytes)
+            data = await websocket.receive_bytes()
+
+            # STT
+            text = await ai_engine.speech_to_text(data)
+            if not text:
+                # send minimal ack to avoid client "stuck" states
+                await websocket.send_json({"type": "noop"})
+                continue
+
+            call.transcript += f"User: {text}\n"
+
+            # Check KB first
+            answer, confidence = await knowledge_manager.find_answer(text)
+
+            if confidence >= Config.CONFIDENCE_THRESHOLD:
+                response_text = answer
+                call.outcome = call.outcome or "answered"
+            else:
+                # human transfer intent?
+                if any(k in text.lower() for k in Config.ROUTE_TO_HUMAN_KEYWORDS):
+                    msg = "Transferring you to a human agent."
+                    await websocket.send_json({"type": "transfer", "message": msg})
+                    # Graceful close so client escalates
+                    await websocket.send_json({"type": "closing", "reason": "transfer"})
+                    await websocket.close(code=1000)
+                    call.outcome = "transferred"
+                    break
+                # LLM
+                response_text = await ai_engine.generate_response(text)
+                # record unknown for later curation
+                uq = UnknownQuestion(
+                    id=f"unknown_{uuid4().hex}",
+                    question=text,
+                    call_id=call_id,
+                    timestamp=now_utc(),
+                    suggested_answer=response_text
+                )
+                await db_manager.save_unknown_question(uq)
+
+            call.transcript += f"Agent: {response_text}\n"
+            call.confidence_score = confidence
+
+            # TTS (MP3)
+            audio_bytes = await ai_engine.text_to_speech(response_text)
+
+            await websocket.send_json({
+                "type": "response",
+                "text": response_text,
+                "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
+                "audio_mime": Config.AUDIO_TTS_MIME,
+                "confidence": confidence
+            })
+
+    except WebSocketDisconnect:
+        logger.info(f"Call disconnected: {call_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+    finally:
+        call.end_time = now_utc()
+        await db_manager.save_call(call)
+
+# ---- API (protected if API key configured) -----------------------------------
 @app.post("/api/knowledge/add")
-async def add_knowledge(request: Request):
-    """Add knowledge item manually"""
+async def add_knowledge(request: Request, _: None = Depends(require_api_key)):
     data = await request.json()
-    
-    knowledge_manager.add_knowledge_item(
-        question=data["question"],
-        answer=data["answer"],
-        source="manual"
-    )
-    
-    return {"status": "success", "message": "Knowledge item added"}
+    q = (data.get("question") or "").strip()
+    a = (data.get("answer") or "").strip()
+    if not q or not a:
+        raise HTTPException(status_code=400, detail="Missing question/answer.")
+    if len(q) > Config.MAX_INPUT_LEN or len(a) > Config.MAX_INPUT_LEN:
+        raise HTTPException(status_code=413, detail="Input too long.")
+    await knowledge_manager.add_knowledge_item(q, a, source="manual")
+    return {"status": "success", "message": "Knowledge item added."}
 
 @app.post("/api/knowledge/scrape")
-async def scrape_website(request: Request):
-    """Scrape website for knowledge"""
+async def scrape_website(request: Request, _: None = Depends(require_api_key)):
     data = await request.json()
-    website_url = data["url"]
-    
-    try:
-        knowledge_manager.scrape_website_knowledge(website_url)
-        return {"status": "success", "message": f"Website {website_url} scraped successfully"}
-    except Exception as e:
-        logger.error(f"Website scraping error: {e}")
-        return {"status": "error", "message": str(e)}
+    url = (data.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing url.")
+    qa_pairs = await scraper.scrape_website(url)
+    for qa in qa_pairs:
+        await knowledge_manager.add_knowledge_item(
+            qa["question"], qa["answer"], source=f"scraped:{qa['source']}"
+        )
+    return {"status": "success", "count": len(qa_pairs)}
 
 @app.get("/api/knowledge/unknown")
-async def get_unknown_questions():
-    """Get unresolved questions"""
-    questions = db_manager.get_unknown_questions(resolved=False)
-    return {"questions": [asdict(q) for q in questions]}
+async def get_unknown_questions(_: None = Depends(require_api_key)):
+    qs = await db_manager.get_unknown_questions(resolved=False)
+    return {"questions": [asdict(q) for q in qs]}
 
 @app.post("/api/knowledge/resolve")
-async def resolve_unknown_question(request: Request):
-    """Resolve unknown question by adding to knowledge base"""
+async def resolve_unknown_question(request: Request, _: None = Depends(require_api_key)):
     data = await request.json()
-    
-    # Add to knowledge base
-    knowledge_manager.add_knowledge_item(
-        question=data["question"],
-        answer=data["answer"],
-        source="resolved"
-    )
-    
-    # Mark as resolved
-    conn = sqlite3.connect(Config.DATABASE_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE unknown_questions SET resolved = TRUE WHERE id = ?",
-        (data["question_id"],)
-    )
-    conn.commit()
-    conn.close()
-    
-    return {"status": "success", "message": "Question resolved"}
+    qid = (data.get("question_id") or "").strip()
+    q = (data.get("question") or "").strip()
+    a = (data.get("answer") or "").strip()
+    if not (qid and q and a):
+        raise HTTPException(status_code=400, detail="Missing fields.")
+
+    await knowledge_manager.add_knowledge_item(q, a, source="resolved")
+
+    async with aiosqlite.connect(Config.DATABASE_PATH) as conn:
+        await conn.execute("UPDATE unknown_questions SET resolved = 1 WHERE id = ?", (qid,))
+        await conn.commit()
+
+    return {"status": "success", "message": "Question resolved."}
 
 @app.get("/api/stats")
-async def get_statistics():
-    """Get system statistics"""
-    stats = db_manager.get_call_statistics()
-    knowledge_count = len(knowledge_manager.knowledge_items)
-    
-    stats["knowledge_items"] = knowledge_count
+async def get_statistics(_: None = Depends(require_api_key)):
+    stats = await db_manager.get_call_statistics()
+    stats["knowledge_items"] = len(knowledge_manager.knowledge_items)
     return stats
 
 @app.post("/api/sms/send")
-async def send_sms(request: Request):
-    """Send SMS (mock implementation for local system)"""
+async def send_sms(request: Request, _: None = Depends(require_api_key)):
+    # Placeholder; integrate Twilio/other here
     data = await request.json()
-    
-    # In a real implementation, this would integrate with Twilio
-    logger.info(f"SMS would be sent to {data['phone']}: {data['message']}")
-    
-    return {"status": "success", "message": "SMS sent (simulated)"}
+    phone = (data.get("phone") or "").strip()
+    msg = (data.get("message") or "").strip()
+    if not phone or not msg:
+        raise HTTPException(status_code=400, detail="Missing phone/message.")
+    logger.info(f"[SIMULATED SMS] to {phone}: {msg}")
+    return {"status": "success", "message": "SMS sent (simulated)."}
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {"status": "healthy", "service": "AI Voice Agent"}
 
+# ------------------------------------------------------------------------------
+# Entrypoint
+# ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting AI Voice Agent System (Lightweight Version)")
-    logger.info(f"Dashboard will be available at http://localhost:{Config.PORT}")
-    logger.info(f"Voice interface at http://localhost:{Config.PORT}/voice-interface")
-    
-    uvicorn.run(
-        app, 
-        host=Config.HOST, 
-        port=Config.PORT,
-        log_level="info"
-    )
+    logger.info("Starting AI Voice Agent System (Lightweight Version, refactored)")
+    logger.info(f"Dashboard: http://localhost:{Config.PORT}")
+    logger.info(f"Voice UI:  http://localhost:{Config.PORT}/voice-interface")
+    uvicorn.run(app, host=Config.HOST, port=Config.PORT, log_level="info")
