@@ -154,6 +154,41 @@ class LightweightAIEngine:
         except Exception as e:
             logger.error(f"Error initializing AI services: {e}")
             raise
+    def convert_webm_to_wav(self, webm_data: bytes) -> bytes:
+        """Convert WebM audio to WAV format"""
+        try:
+            # Save WebM data to temp file
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as webm_file:
+                webm_file.write(webm_data)
+                webm_path = webm_file.name
+            
+            # Convert to WAV using ffmpeg (if available) or return original
+            wav_path = webm_path.replace('.webm', '.wav')
+            
+            try:
+                subprocess.run([
+                    'ffmpeg', '-i', webm_path, '-ar', '16000', '-ac', '1', 
+                    '-f', 'wav', wav_path, '-y'
+                ], check=True, capture_output=True)
+                
+                with open(wav_path, 'rb') as f:
+                    wav_data = f.read()
+                
+                os.unlink(webm_path)
+                os.unlink(wav_path)
+                return wav_data
+                
+            except:
+                # If ffmpeg fails, return original data
+                os.unlink(webm_path)
+                return webm_data
+                
+        except Exception as e:
+            logger.error(f"Audio conversion error: {e}")
+            return webm_data
+
+
+
     
     def speech_to_text(self, audio_data: bytes) -> str:
         """Convert speech to text using OpenAI Whisper"""
@@ -161,9 +196,10 @@ class LightweightAIEngine:
             if not self.openai_client:
                 return ""
                 
-            # Save audio data to temporary file
-            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_file:
-                temp_file.write(audio_data)
+            # Convert and save audio data to temporary file
+            converted_audio = self.convert_webm_to_wav(audio_data)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_file.write(converted_audio)
                 temp_path = temp_file.name
             
             # Use OpenAI Whisper API
