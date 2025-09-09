@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Self-Sufficient AI Voice Agent System – Final Production Version
+AI Voice Agent – Final Production + UI
 - Async-safe (aiosqlite + threadpools for blocking ops)
 - Truthful audio MIME (gTTS -> MP3)
 - Buffered WS audio with size caps and timeouts
 - Circuit breakers + retries for OpenAI calls
 - Monotonic, thread-safe rate limiting + global connection cap
 - Atomic DB updates and correct UTC date-range stats
-- Lifespan startup (no deprecated @app.on_event), root/health routes, correct port logs
+- Minimal inlined UI at '/'
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 import uvicorn
 
 import os
@@ -24,11 +25,10 @@ import time
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from uuid import uuid4
 from pathlib import Path
 from collections import defaultdict
-from contextlib import asynccontextmanager  # NEW
 
 import aiosqlite
 from starlette.concurrency import run_in_threadpool
@@ -61,7 +61,9 @@ class Config:
     OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
     # CORS
-    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",")
+    CORS_ORIGINS = [o.strip() for o in os.getenv(
+        "CORS_ORIGINS", "https://ai-voice-agent-uz9g.onrender.com,http://localhost:3000,http://localhost:8080"
+    ).split(",") if o.strip()]
 
     # App
     BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
@@ -71,9 +73,9 @@ class Config:
     SAMPLE_RATE = 16000
     STT_TARGET_RATE = 16000
     AUDIO_TTS_MIME = "audio/mpeg"  # gTTS -> MP3
-    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "5242880"))       # 5 MB per frame
+    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "5242880"))           # 5 MB per frame
     MAX_COMBINED_AUDIO = int(os.getenv("MAX_COMBINED_AUDIO", "15728640"))  # 15 MB per batch
-    AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "3"))       # frames per STT batch
+    AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "1"))           # frames per STT batch (1 = immediate)
 
     # KB / matching
     SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.30"))
@@ -81,7 +83,7 @@ class Config:
 
     # Call control
     MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "600"))     # seconds
-    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "10"))      # seconds
+    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "5"))       # seconds
 
     # Server
     HOST = os.getenv("HOST", "0.0.0.0")
@@ -696,10 +698,9 @@ class KnowledgeBaseManager:
             if sim > best[1] and sim >= Config.SIMILARITY_THRESHOLD:
                 best = (it.answer, sim, it.id)
 
-        # Increment usage ONCE for the final best match (bug fix)
         if best[2]:
             await self.db.increment_usage_count(best[2])
-            # Database is source of truth - no local update needed
+            # DB is source of truth for usage_count
 
         return best
 
@@ -711,7 +712,7 @@ db_manager = DatabaseManager(Config.DATABASE_PATH)
 ai_engine = LightweightAIEngine()
 knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
 
-app = FastAPI(title="AI Voice Agent System - Final Production", version="1.5.1")
+app = FastAPI(title="AI Voice Agent System - Final Production", version="1.6.0")
 
 # CORS
 app.add_middleware(
@@ -722,53 +723,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Lifespan (replaces deprecated @app.on_event) ---
-async def _startup_inner():
+
+@app.on_event("startup")
+async def _startup():
     await db_manager.init_database()
     await knowledge_manager.load()
     if not ffmpeg_available():
         logger.warning("ffmpeg not found; STT will fall back to WEBM input for transcription.")
+    # Log effective URLs for PaaS environments that override PORT
+    eff_port = int(os.getenv("PORT", str(Config.PORT)))
+    http_url = f"http://localhost:{eff_port}"
+    ws_url = f"ws://localhost:{eff_port}/ws/voice"
+    logger.info(f"Dashboard (effective): {http_url}")
+    logger.info(f"WS (effective):        {ws_url}")
+    logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
     logger.info("Startup complete.")
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # STARTUP
-    await _startup_inner()
-    yield
-    # (No explicit shutdown logic previously; add here if needed)
-
-app.router.lifespan_context = lifespan  # activate lifespan
-
 
 # ------------------------------------------------------------------------------
-# HTTP routes
+# Inlined UI (restores '/' page)
 # ------------------------------------------------------------------------------
-@app.get("/")
-async def root():
-    # Effective URLs using the live PORT to avoid confusion on platforms that inject PORT
-    effective_http = f"http://localhost:{Config.PORT}"
-    effective_ws = f"ws://localhost:{Config.PORT}/ws/voice"
-    return {
-        "status": "ok",
-        "docs": "/docs",
-        "health": "/health",
-        "ws": "/ws/voice",
-        "effective_http": effective_http,
-        "effective_ws": effective_ws,
-        "configured_base_url": Config.BASE_URL,
-    }
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return """
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>AI Voice Agent</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial;max-width:900px;margin:40px auto;padding:0 16px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:12px 0}
+  button{padding:10px 14px;border:1px solid #ccc;border-radius:10px;background:#fafafa;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  #log{white-space:pre-wrap;background:#0b1020;color:#cde; padding:12px;border-radius:10px; min-height:120px}
+  #status{font-weight:600}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#eef}
+</style>
+<h1>AI Voice Agent</h1>
+<div class="row"><span>Status:</span><span id="status" class="badge">Idle</span></div>
+<div class="row">
+  <button id="connectBtn">Connect</button>
+  <button id="startBtn" disabled>Start Mic</button>
+  <button id="stopBtn" disabled>Stop Mic</button>
+  <button id="disconnectBtn" disabled>Disconnect</button>
+</div>
+<div class="row"><audio id="player" controls></audio></div>
+<h3>Log</h3>
+<div id="log"></div>
+<script>
+(() => {
+  const statusEl = document.getElementById('status');
+  const logEl = document.getElementById('log');
+  const player = document.getElementById('player');
+  const connectBtn = document.getElementById('connectBtn');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const disconnectBtn = document.getElementById('disconnectBtn');
+  let ws = null, stream = null, recorder = null;
 
-@app.get("/health")
-async def health():
-    stats = await db_manager.get_call_statistics()
-    return {
-        "status": "healthy",
-        "time": now_utc().isoformat(),
-        "active_connections": connection_tracker.count(),
-        "rate_limiter": rate_limiter.stats(),
-        "circuit_breakers": ai_engine.breakers_status(),
-        "stats_today": stats
+  function log(msg, obj){
+    const line = (new Date()).toLocaleTimeString() + " — " + msg + (obj? " " + JSON.stringify(obj): "");
+    logEl.textContent += line + "\\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function setStatus(s){ statusEl.textContent = s; }
+  function wsUrl(){
+    const proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+    return proto + location.host + '/ws/voice';
+  }
+
+  connectBtn.onclick = () => {
+    if(ws && ws.readyState === WebSocket.OPEN) return;
+    ws = new WebSocket(wsUrl());
+    setStatus('Connecting');
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => { setStatus('Connected'); log('WS open'); startBtn.disabled = false; disconnectBtn.disabled = false; connectBtn.disabled = true; };
+    ws.onclose = ev => {
+      setStatus('Disconnected'); log('WS close', {code: ev.code, reason: ev.reason});
+      startBtn.disabled = true; stopBtn.disabled = true; disconnectBtn.disabled = true; connectBtn.disabled = false;
+      if(recorder && recorder.state !== 'inactive') recorder.stop();
+      if(stream) { stream.getTracks().forEach(t=>t.stop()); stream = null; }
+    };
+    ws.onerror = () => { log('WS error'); };
+    ws.onmessage = ev => {
+      try {
+        const msg = JSON.parse(ev.data);
+        if(msg.type === 'heartbeat'){ setStatus('Connected (heartbeat)'); }
+        else if(msg.type === 'listening'){ setStatus('Listening…'); }
+        else if(msg.type === 'response'){
+          setStatus('Responded');
+          log('Agent: ' + msg.text + ' (conf=' + (msg.confidence ?? 0).toFixed(2) + ')');
+          if(msg.audio_b64 && msg.audio_mime){
+            player.src = 'data:' + msg.audio_mime + ';base64,' + msg.audio_b64;
+            player.play().catch(()=>{});
+          }
+        } else if(msg.type === 'transfer'){ setStatus('Transfer'); log('Transfer: ' + msg.message); }
+        else if(msg.type === 'error'){ setStatus('Error'); log('Server error: ' + msg.message); }
+        else if(msg.type === 'closing'){ setStatus('Closing: ' + (msg.reason||'')); }
+        else { log('Recv', msg); }
+      } catch(e) { log('Non-JSON message'); }
+    };
+  };
+
+  startBtn.onclick = async () => {
+    if(!ws || ws.readyState !== WebSocket.OPEN) { log('WS not open'); return; }
+    if(!navigator.mediaDevices || !window.MediaRecorder){
+      alert('MediaRecorder not supported in this browser. Use Chrome/Edge/Firefox.');
+      return;
     }
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({audio: true});
+      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
+                   (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
+      recorder = new MediaRecorder(stream, mime ? {mimeType: mime, audioBitsPerSecond: 32000} : undefined);
+      recorder.ondataavailable = async (e) => {
+        if(e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN){
+          const buf = await e.data.arrayBuffer();
+          ws.send(buf); // binary frames
+        }
+      };
+      recorder.start(300); // ~300ms chunks; server batches too
+      setStatus('Recording'); startBtn.disabled = true; stopBtn.disabled = false; disconnectBtn.disabled = false;
+      log('Recorder started with mime=' + (mime||'default'));
+    } catch(err){
+      log('getUserMedia error: ' + err);
+    }
+  };
+
+  stopBtn.onclick = () => {
+    if(recorder && recorder.state !== 'inactive') recorder.stop();
+    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+    setStatus('Connected'); startBtn.disabled = false; stopBtn.disabled = true; log('Recorder stopped');
+  };
+
+  disconnectBtn.onclick = () => {
+    if(recorder && recorder.state !== 'inactive') recorder.stop();
+    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+    if(ws){ ws.close(1000, 'client_close'); }
+  };
+})();
+</script>
+</html>
+    """
 
 
 # ------------------------------------------------------------------------------
@@ -868,7 +966,8 @@ async def voice_websocket(websocket: WebSocket):
                 call.outcome = call.outcome or "answered"
             else:
                 # human escalation?
-                if any(k in text.lower() for k in ["human", "person", "agent", "representative", "manager", "supervisor", "help me", "speak to someone"]):
+                if any(k in text.lower() for k in
+                       ["human", "person", "agent", "representative", "manager", "supervisor", "help me", "speak to someone"]):
                     await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
                     await websocket.send_json({"type": "closing", "reason": "transfer"})
                     await websocket.close(code=1000)
@@ -922,15 +1021,28 @@ async def voice_websocket(websocket: WebSocket):
 
 
 # ------------------------------------------------------------------------------
+# Minimal health/stats endpoint
+# ------------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    stats = await db_manager.get_call_statistics()
+    return {
+        "status": "healthy",
+        "time": now_utc().isoformat(),
+        "active_connections": connection_tracker.count(),
+        "rate_limiter": rate_limiter.stats(),
+        "circuit_breakers": ai_engine.breakers_status(),
+        "stats_today": stats
+    }
+
+
+# ------------------------------------------------------------------------------
 # Entrypoint
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting AI Voice Agent System (Final Production Version)")
-    # Log EFFECTIVE URLs based on HOST/PORT to avoid BASE_URL mismatch
-    effective_http = f"http://localhost:{Config.PORT}"
-    effective_ws = f"ws://localhost:{Config.PORT}/ws/voice"
-    logger.info(f"Dashboard (effective): {effective_http}")
-    logger.info(f"WS (effective):        {effective_ws}")
-    if Config.BASE_URL:
-        logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
-    uvicorn.run(app, host=Config.HOST, port=Config.PORT, log_level="info")
+    logger.info("Starting AI Voice Agent System (Final Production + UI)")
+    eff_port = int(os.getenv("PORT", str(Config.PORT)))
+    logger.info(f"Dashboard (effective): http://localhost:{eff_port}")
+    logger.info(f"WS (effective):        ws://localhost:{eff_port}/ws/voice")
+    logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
+    uvicorn.run(app, host=Config.HOST, port=eff_port, log_level="info")
