@@ -7,6 +7,7 @@ Self-Sufficient AI Voice Agent System – Final Production Version
 - Circuit breakers + retries for OpenAI calls
 - Monotonic, thread-safe rate limiting + global connection cap
 - Atomic DB updates and correct UTC date-range stats
+- Lifespan startup (no deprecated @app.on_event), root/health routes, correct port logs
 """
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -27,6 +28,7 @@ from dataclasses import dataclass, asdict
 from uuid import uuid4
 from pathlib import Path
 from collections import defaultdict
+from contextlib import asynccontextmanager  # NEW
 
 import aiosqlite
 from starlette.concurrency import run_in_threadpool
@@ -60,7 +62,7 @@ class Config:
 
     # CORS
     CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",")
-    
+
     # App
     BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
     DATABASE_PATH = os.getenv("DATABASE_PATH", "voice_agent.db")
@@ -694,10 +696,11 @@ class KnowledgeBaseManager:
             if sim > best[1] and sim >= Config.SIMILARITY_THRESHOLD:
                 best = (it.answer, sim, it.id)
 
-            if best[2]:
-                await self.db.increment_usage_count(best[2])
-                # Database is source of truth - no local update needed
-        
+        # Increment usage ONCE for the final best match (bug fix)
+        if best[2]:
+            await self.db.increment_usage_count(best[2])
+            # Database is source of truth - no local update needed
+
         return best
 
 
@@ -708,7 +711,7 @@ db_manager = DatabaseManager(Config.DATABASE_PATH)
 ai_engine = LightweightAIEngine()
 knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
 
-app = FastAPI(title="AI Voice Agent System - Final Production", version="1.5.0")
+app = FastAPI(title="AI Voice Agent System - Final Production", version="1.5.1")
 
 # CORS
 app.add_middleware(
@@ -719,14 +722,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("startup")
-async def _startup():
+# --- Lifespan (replaces deprecated @app.on_event) ---
+async def _startup_inner():
     await db_manager.init_database()
     await knowledge_manager.load()
     if not ffmpeg_available():
         logger.warning("ffmpeg not found; STT will fall back to WEBM input for transcription.")
     logger.info("Startup complete.")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # STARTUP
+    await _startup_inner()
+    yield
+    # (No explicit shutdown logic previously; add here if needed)
+
+app.router.lifespan_context = lifespan  # activate lifespan
+
+
+# ------------------------------------------------------------------------------
+# HTTP routes
+# ------------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    # Effective URLs using the live PORT to avoid confusion on platforms that inject PORT
+    effective_http = f"http://localhost:{Config.PORT}"
+    effective_ws = f"ws://localhost:{Config.PORT}/ws/voice"
+    return {
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+        "ws": "/ws/voice",
+        "effective_http": effective_http,
+        "effective_ws": effective_ws,
+        "configured_base_url": Config.BASE_URL,
+    }
+
+@app.get("/health")
+async def health():
+    stats = await db_manager.get_call_statistics()
+    return {
+        "status": "healthy",
+        "time": now_utc().isoformat(),
+        "active_connections": connection_tracker.count(),
+        "rate_limiter": rate_limiter.stats(),
+        "circuit_breakers": ai_engine.breakers_status(),
+        "stats_today": stats
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -880,26 +922,15 @@ async def voice_websocket(websocket: WebSocket):
 
 
 # ------------------------------------------------------------------------------
-# Minimal health/stats endpoint
-# ------------------------------------------------------------------------------
-@app.get("/health")
-async def health():
-    stats = await db_manager.get_call_statistics()
-    return {
-        "status": "healthy",
-        "time": now_utc().isoformat(),
-        "active_connections": connection_tracker.count(),
-        "rate_limiter": rate_limiter.stats(),
-        "circuit_breakers": ai_engine.breakers_status(),
-        "stats_today": stats
-    }
-
-
-# ------------------------------------------------------------------------------
 # Entrypoint
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     logger.info("Starting AI Voice Agent System (Final Production Version)")
-    logger.info(f"Dashboard: {Config.BASE_URL}")
-    logger.info(f"WS:       {Config.BASE_URL.replace('http', 'ws')}/ws/voice")
+    # Log EFFECTIVE URLs based on HOST/PORT to avoid BASE_URL mismatch
+    effective_http = f"http://localhost:{Config.PORT}"
+    effective_ws = f"ws://localhost:{Config.PORT}/ws/voice"
+    logger.info(f"Dashboard (effective): {effective_http}")
+    logger.info(f"WS (effective):        {effective_ws}")
+    if Config.BASE_URL:
+        logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
     uvicorn.run(app, host=Config.HOST, port=Config.PORT, log_level="info")
