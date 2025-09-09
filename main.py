@@ -155,34 +155,34 @@ class LightweightAIEngine:
             logger.error(f"Error initializing AI services: {e}")
             raise
     
-def speech_to_text(self, audio_data: bytes) -> str:
-    """Convert speech to text using OpenAI Whisper"""
-    try:
-        if not self.openai_client:
+    def speech_to_text(self, audio_data: bytes) -> str:
+        """Convert speech to text using OpenAI Whisper"""
+        try:
+            if not self.openai_client:
+                return ""
+                
+            # Save audio data to temporary file
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_file:
+                temp_file.write(audio_data)
+                temp_path = temp_file.name
+            
+            # Use OpenAI Whisper API
+            with open(temp_path, 'rb') as audio_file:
+                transcript = self.openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file
+                )
+                
+            # Clean up temp file
+            os.unlink(temp_path)
+            
+            text = transcript.text.strip()
+            logger.info(f"Transcribed: {text}")
+            return text
+            
+        except Exception as e:
+            logger.error(f"Speech to text error: {e}")
             return ""
-            
-        # Save audio data to temporary file
-        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as temp_file:
-            temp_file.write(audio_data)
-            temp_path = temp_file.name
-        
-        # Use OpenAI Whisper API
-        with open(temp_path, 'rb') as audio_file:
-            transcript = self.openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-            
-        # Clean up temp file
-        os.unlink(temp_path)
-        
-        text = transcript.text.strip()
-        logger.info(f"Transcribed: {text}")
-        return text
-        
-    except Exception as e:
-        logger.error(f"Speech to text error: {e}")
-        return ""
     
     def text_to_speech(self, text: str) -> bytes:
         """Convert text to speech using Google Text-to-Speech"""
