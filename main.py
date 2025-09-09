@@ -694,9 +694,9 @@ class KnowledgeBaseManager:
             if sim > best[1] and sim >= Config.SIMILARITY_THRESHOLD:
                 best = (it.answer, sim, it.id)
 
-        if best[2]:
-            await self.db.increment_usage_count(best[2])
-            # Database is source of truth - no local update needed
+            if best[2]:
+                await self.db.increment_usage_count(best[2])
+                # Database is source of truth - no local update needed
         
         return best
 
