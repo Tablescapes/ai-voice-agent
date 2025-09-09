@@ -698,7 +698,7 @@ class KnowledgeBaseManager:
             await self.db.increment_usage_count(best[2])
             # Database is source of truth - no local update needed
         
-                return best
+        return best
 
 
 # ------------------------------------------------------------------------------
