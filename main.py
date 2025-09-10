@@ -412,15 +412,19 @@ class LightweightAIEngine:
                     text = await run_in_threadpool(_transcribe_sync, p, Config.OPENAI_STT_MODEL)
                     self.cb_stt.record_success()
                     return text
-import traceback
-except Exception as e:
-    self.cb_chat.record_failure()
-    logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
-
+                except Exception as e:
+                    self.cb_stt.record_failure()
+                    logger.error(f"STT error after retries: {e}")
                     return ""
+
         text = await _transcribe()
         logger.info(f"STT text='{text}'")
         return text
+
+
+
+
+
 
     def _tts_sync(self, text: str) -> bytes:
         with tempfile.TemporaryDirectory() as td:
@@ -465,8 +469,10 @@ except Exception as e:
                 if text:
                     return text
             except Exception as e:
+                import traceback
                 self.cb_chat.record_failure()
-                logger.error(f"Chat error after retries: {e}")
+                logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
+
 
         # Fallback
         u = (user_input or "").lower()
@@ -1152,7 +1158,7 @@ async def api_add_kb(payload: Dict[str, Any]):
     await knowledge_manager.add_knowledge_item(q, a, source="manual")
     return {"status":"success","message":"Knowledge item added"}
 
-from fastapi import HTTPException
+
 
 @app.get("/debug/openai", include_in_schema=False)
 async def debug_openai():
