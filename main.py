@@ -56,6 +56,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)5s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("voice_agent")
+ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Tablescapes Assistant")
+
 
 AI_UNAVAILABLE_MSG = (
     "Sorry—our AI is temporarily unavailable. I can transfer you to a person or try again in a moment."
@@ -481,19 +483,49 @@ class LightweightAIEngine:
 
 
         # Fallback (rule-based)
-        u = (user_input or "").lower()
-        if any(w in u for w in ["hello", "hi", "hey", "good morning", "good afternoon"]):
-            return "Hello! How can I help you today?"
-        if any(w in u for w in ["help", "support", "question"]):
-            return "Sure—what do you need help with?"
-        if any(w in u for w in ["price", "cost", "pricing", "how much"]):
+        u = (user_input or "").strip().lower()
+
+        if not u:
+            return "Could you repeat that?"
+
+        # Small talk / presence
+        if any(p in u for p in ["are you there", "you there", "can you hear me", "hello?", "hi?"]):
+            return "I'm here and listening."
+
+        # Greeting
+        if any(p in u for p in ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]):
+            return f"Hi—I'm {ASSISTANT_NAME}. How can I help?"
+
+        # Identity
+        if any(p in u for p in ["what's your name", "whats your name", "what is your name", "who are you", "your name"]):
+            return f"I'm {ASSISTANT_NAME}."
+
+        # Capabilities
+        if any(p in u for p in ["what can you do", "what do you do", "capabilities"]):
+            return ("I can answer questions about inventory, pricing, delivery, policies, and general event-rental info. "
+                    "Tell me what item or topic you have in mind.")
+
+        # “Are you educated?”
+        if any(p in u for p in ["are you educated", "are you smart", "education", "degree"]):
+            return ("I’m a virtual assistant trained on our knowledge base and common patterns. "
+                    "I don’t hold degrees, but I can help with accurate info and next steps.")
+
+        # Existing task intents
+        if any(p in u for p in ["price", "cost", "pricing", "how much"]):
             return "Which item do you want pricing for?"
-        if any(w in u for w in ["hours", "open", "closed"]):
+        if any(p in u for p in ["hours", "open", "closed"]):
             return "Tell me which location and I’ll check hours."
-        if any(w in u for w in ["shipping", "delivery", "ship"]):
+        if any(p in u for p in ["shipping", "delivery", "ship"]):
             return "What would you like to know about delivery options?"
-        if any(w in u for w in ["return", "exchange", "refund"]):
+        if any(p in u for p in ["return", "exchange", "refund"]):
             return "Which item/order are you asking about?"
+
+        # Politeness / closing
+        if any(p in u for p in ["thanks", "thank you", "thx", "appreciate it"]):
+            return "You’re welcome!"
+        if any(p in u for p in ["bye", "goodbye", "see ya", "see you"]):
+            return "Thanks for visiting—talk soon."
+
         return "I can help with that. Could you clarify the item or topic?"
 
     def get_embedding(self, text: str) -> List[float]:
