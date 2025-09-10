@@ -412,9 +412,11 @@ class LightweightAIEngine:
                     text = await run_in_threadpool(_transcribe_sync, p, Config.OPENAI_STT_MODEL)
                     self.cb_stt.record_success()
                     return text
-                except Exception as e:
-                    self.cb_stt.record_failure()
-                    logger.error(f"STT error after retries: {e}")
+import traceback
+except Exception as e:
+    self.cb_chat.record_failure()
+    logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
+
                     return ""
         text = await _transcribe()
         logger.info(f"STT text='{text}'")
@@ -1149,6 +1151,32 @@ async def api_add_kb(payload: Dict[str, Any]):
         return JSONResponse({"status":"error","message":"question and answer required"}, status_code=400)
     await knowledge_manager.add_knowledge_item(q, a, source="manual")
     return {"status":"success","message":"Knowledge item added"}
+
+from fastapi import HTTPException
+
+@app.get("/debug/openai", include_in_schema=False)
+async def debug_openai():
+    try:
+        if not ai_engine.openai_client:
+            raise RuntimeError("no_openai_client (missing OPENAI_API_KEY?)")
+        resp = await run_in_threadpool(
+            ai_engine._sync_openai_chat,
+            [
+                {"role": "system", "content": "You are a concise assistant."},
+                {"role": "user", "content": "ping"}
+            ],
+            Config.OPENAI_CHAT_MODEL,
+            0.2,
+            10
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        return {"ok": True, "model": Config.OPENAI_CHAT_MODEL, "reply": txt[:100]}
+    except Exception as e:
+        # expose full detail so we see the cause
+        return {"ok": False, "error": repr(e)}
+
+
+
 
 @app.post("/api/knowledge/scrape")
 async def api_scrape(payload: Dict[str, Any]):
