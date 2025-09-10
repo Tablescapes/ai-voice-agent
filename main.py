@@ -475,9 +475,10 @@ class LightweightAIEngine:
                 import traceback
                 self.cb_chat.record_failure()
                 logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
-                s = str(e).lower()
-                if "insufficient_quota" in s or "429" in s or "rate limit" in s:
-                    return AI_UNAVAILABLE_MSG
+                # If it's quota/rate-limit, do NOT return the outage message; fall through to rules/KB.
+                # This keeps chat usable even when the LLM is throttled or out of quota.
+                # (We deliberately avoid returning AI_UNAVAILABLE_MSG here.)
+
 
         # Fallback (rule-based)
         u = (user_input or "").lower()
