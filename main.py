@@ -268,7 +268,7 @@ class CircuitBreaker:
         self.success_count = 0
         self.opened_at: Optional[float] = None
         self.half_open_calls = 0
-               self.lock = threading.Lock()
+        self.lock = threading.Lock()
 
     def can_call(self) -> bool:
         with self.lock:
@@ -289,6 +289,7 @@ class CircuitBreaker:
                     self.half_open_calls += 1
                     return True
                 return False
+            return False
 
     def record_success(self):
         with self.lock:
@@ -327,6 +328,7 @@ class CircuitBreaker:
                 "success_count": self.success_count,
                 "half_open_calls": self.half_open_calls
             }
+
 
 # ------------------------------------------------------------------------------
 # AI Engine
