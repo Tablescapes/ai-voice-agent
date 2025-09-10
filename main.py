@@ -447,48 +447,51 @@ class LightweightAIEngine:
             logger.error(f"TTS error: {e}")
             return b""
 
-    async def generate_response(self, user_input: str, context: str = "") -> str:
-        """LLM response or rule-based fallback, guarded by circuit breaker."""
-        user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
+async def generate_response(self, user_input: str, context: str = "") -> str:
+    """LLM response or rule-based fallback, guarded by circuit breaker."""
+    user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
 
-        if self.openai_client and self.cb_chat.can_call():
-            try:
-                resp = await run_in_threadpool(
-                    self._sync_openai_chat,
-                    [
-                        {"role": "system",
-                         "content": f"You are a concise customer service agent for a tableware and event-rental business. Keep answers accurate and succinct. Context: {context}"},
-                        {"role": "user", "content": user_input}
-                    ],
-                    Config.OPENAI_CHAT_MODEL,
-                    0.2,
-                    220
-                )
-                text = (resp.choices[0].message.content or "").strip()
-                self.cb_chat.record_success()
-                if text:
-                    return text
-            except Exception as e:
-                import traceback
-                self.cb_chat.record_failure()
-                logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
+    if self.openai_client and self.cb_chat.can_call():
+        try:
+            resp = await run_in_threadpool(
+                self._sync_openai_chat,
+                [
+                    {"role": "system",
+                     "content": f"You are a concise customer service agent for a tableware and event-rental business. Keep answers accurate and succinct. Context: {context}"},
+                    {"role": "user", "content": user_input}
+                ],
+                Config.OPENAI_CHAT_MODEL,
+                0.2,
+                220
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            self.cb_chat.record_success()
+            if text:
+                return text
+        except Exception as e:
+            import traceback
+            self.cb_chat.record_failure()
+            logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
+            # If quota/rate-limits, return a clear, human-friendly line
+            s = str(e).lower()
+            if "insufficient_quota" in s or "429" in s or "rate limit" in s:
+                return AI_UNAVAILABLE_MSG
 
-
-        # Fallback
-        u = (user_input or "").lower()
-        if any(w in u for w in ["hello", "hi", "hey", "good morning", "good afternoon"]):
-            return "Hello! How can I help you today?"
-        if any(w in u for w in ["help", "support", "question"]):
-            return "Sure—what do you need help with?"
-        if any(w in u for w in ["price", "cost", "pricing", "how much"]):
-            return "Which item do you want pricing for?"
-        if any(w in u for w in ["hours", "open", "closed"]):
-            return "Tell me which location and I’ll check hours."
-        if any(w in u for w in ["shipping", "delivery", "ship"]):
-            return "What would you like to know about delivery options?"
-        if any(w in u for w in ["return", "exchange", "refund"]):
-            return "Which item/order are you asking about?"
-        return "I can help with that. Could you clarify the item or topic?"
+    # Fallback (rule-based)
+    u = (user_input or "").lower()
+    if any(w in u for w in ["hello", "hi", "hey", "good morning", "good afternoon"]):
+        return "Hello! How can I help you today?"
+    if any(w in u for w in ["help", "support", "question"]):
+        return "Sure—what do you need help with?"
+    if any(w in u for w in ["price", "cost", "pricing", "how much"]):
+        return "Which item do you want pricing for?"
+    if any(w in u for w in ["hours", "open", "closed"]):
+        return "Tell me which location and I’ll check hours."
+    if any(w in u for w in ["shipping", "delivery", "ship"]):
+        return "What would you like to know about delivery options?"
+    if any(w in u for w in ["return", "exchange", "refund"]):
+        return "Which item/order are you asking about?"
+    return "I can help with that. Could you clarify the item or topic?"
 
     def get_embedding(self, text: str) -> List[float]:
         words = text.lower().split()
@@ -1108,14 +1111,34 @@ async function addKB(){
 }
 
 async function scrape(){
-  const url = document.getElementById('url').value.trim();
-  if(!url){ alert('Enter URL'); return; }
-  const r = await fetch('/api/knowledge/scrape', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url})});
-  const j = await r.json();
-  document.getElementById('scrapeResult').textContent = JSON.stringify(j);
-  loadStats();
-}
+  const urlEl = document.getElementById('url');
+  const outEl = document.getElementById('scrapeResult');
+  const btn = document.querySelector('button[onclick="scrape()"]');
 
+  const url = urlEl.value.trim();
+  if(!url){ alert('Enter URL'); return; }
+
+  btn.disabled = true;
+  const t0 = Date.now();
+  outEl.textContent = `Starting scrape… ${url}`;
+
+  try {
+    const r = await fetch('/api/knowledge/scrape', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})
+    });
+    const text = await r.text();
+    const msg = `Finished in ${((Date.now()-t0)/1000).toFixed(1)}s\n` +
+                (r.ok ? text : `HTTP ${r.status}\n${text}`);
+    outEl.textContent = msg;
+  } catch (e) {
+    outEl.textContent = `Network error: ${String(e)}`;
+  } finally {
+    btn.disabled = false;
+    loadStats();
+  }
+}
 async function resolveUnknown(id){
   const ans = prompt('Provide the answer for this question:');
   if(!ans) return;
@@ -1191,17 +1214,23 @@ async def api_scrape(payload: Dict[str, Any]):
         return JSONResponse({"status":"error","message":"url required"}, status_code=400)
     try:
         qa = await scraper.scrape(url)
-        # store
         added = 0
         for item in qa:
-            await knowledge_manager.add_knowledge_item(item["question"], item["answer"], source=f"scraped:{item.get('source','')}")
+            await knowledge_manager.add_knowledge_item(
+                item["question"], item["answer"],
+                source=f"scraped:{item.get('source','')}"
+            )
             added += 1
-        return {"status":"success","message":f"Scraped {len(qa)} Q&A; added {added}"}
+        pages = len({x.get("source") for x in qa}) or 0
+        if added == 0:
+            return {"status":"success","message":"Scrape completed, but no Q&A patterns were found","pages_scanned": pages}
+        return {"status":"success","message":f"Scraped {len(qa)} Q&A; added {added}","pages_scanned": pages}
     except ValueError as ve:
         return JSONResponse({"status":"error","message":str(ve)}, status_code=400)
-    except Exception as e:
+    except Exception:
         logger.exception("Scrape failed")
         return JSONResponse({"status":"error","message":"scrape_failed"}, status_code=500)
+
 
 @app.get("/api/knowledge/unknown")
 async def api_unknown():
@@ -1423,29 +1452,35 @@ async def voice_websocket(websocket: WebSocket):
                     call.outcome = "transferred"
                     break
 
-                response_text = await ai_engine.generate_response(text)
-
-                uq = UnknownQuestion(
-                    id=f"unknown_{uuid4().hex}",
-                    question=text,
-                    call_id=call_id,
-                    timestamp=now_utc(),
-                    suggested_answer=response_text
-                )
-                await db_manager.save_unknown_question(uq)
-
-            call.transcript += f"Agent: {response_text}\n"
-            call.confidence_score = confidence
-
-            audio_bytes = await ai_engine.text_to_speech(response_text)
-
-            await websocket.send_json({
-                "type": "response",
-                "text": response_text,
-                "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
-                "audio_mime": Config.AUDIO_TTS_MIME,
-                "confidence": confidence
-            })
+        response_text = await ai_engine.generate_response(text)
+        
+        # Only log "unknown" if AI actually answered (not rate-limited)
+        response_text = await ai_engine.generate_response(text)
+        
+        # Only log "unknown" if AI actually answered (not rate-limited)
+        if response_text != AI_UNAVAILABLE_MSG:
+            uq = UnknownQuestion(
+                id=f"unknown_{uuid4().hex}",
+                question=text,
+                call_id=call_id,
+                timestamp=now_utc(),
+                suggested_answer=response_text
+            )
+            await db_manager.save_unknown_question(uq)
+        
+        # ALWAYS send the response (even the outage message)
+        call.transcript += f"Agent: {response_text}\n"
+        call.confidence_score = confidence
+        
+        audio_bytes = await ai_engine.text_to_speech(response_text)
+        
+        await websocket.send_json({
+            "type": "response",
+            "text": response_text,
+            "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
+            "audio_mime": Config.AUDIO_TTS_MIME,
+            "confidence": confidence
+        })
 
     except WebSocketDisconnect:
         logger.info(f"Call disconnected: {call_id}")
