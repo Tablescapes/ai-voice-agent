@@ -810,30 +810,29 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # Big colorful minimal UI
-    return HTMLResponse(f"""<!doctype html>
+    return HTMLResponse("""<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
 <title>AI Voice Agent</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root {{
+:root {
   --bg:#0f172a; --fg:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --btn:#1e40af; --btn2:#0891b2;
-}}
-* {{ box-sizing:border-box }}
-body {{ background:var(--bg); color:var(--fg); font:16px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:0; padding:24px }}
-h1 {{ margin:0 0 12px 0 }}
-.card {{ background:#0b1220; border:1px solid #263147; border-radius:14px; padding:16px; margin:16px 0; box-shadow:0 0 0 1px rgba(255,255,255,.02) inset }}
-.row {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0 }}
-button {{ padding:12px 16px; border-radius:12px; border:none; background:var(--btn); color:white; cursor:pointer; font-weight:600 }}
-button.secondary {{ background:var(--btn2) }}
-button.danger {{ background:var(--err) }}
-button:disabled {{ opacity:.5; cursor:not-allowed }}
-.toggle {{ display:flex; align-items:center; gap:8px }}
-.badge {{ display:inline-block; padding:4px 10px; border-radius:999px; background:#172036; color:#a6b0c6; font-size:12px; }}
-#log {{ white-space:pre-wrap; background:#0a0f1f; color:#cfe8ff; padding:12px; border-radius:12px; min-height:140px; max-height:300px; overflow:auto }}
-label {{ color:#9fb2d4; font-size:14px }}
-a.link {{ color:#7dd3fc; text-decoration:none }}
+}
+* { box-sizing:border-box }
+body { background:var(--bg); color:var(--fg); font:16px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:0; padding:24px }
+h1 { margin:0 0 12px 0 }
+.card { background:#0b1220; border:1px solid #263147; border-radius:14px; padding:16px; margin:16px 0; box-shadow:0 0 0 1px rgba(255,255,255,.02) inset }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0 }
+button { padding:12px 16px; border-radius:12px; border:none; background:var(--btn); color:white; cursor:pointer; font-weight:600 }
+button.secondary { background:var(--btn2) }
+button.danger { background:var(--err) }
+button:disabled { opacity:.5; cursor:not-allowed }
+.toggle { display:flex; align-items:center; gap:8px }
+.badge { display:inline-block; padding:4px 10px; border-radius:999px; background:#172036; color:#a6b0c6; font-size:12px; }
+#log { white-space:pre-wrap; background:#0a0f1f; color:#cfe8ff; padding:12px; border-radius:12px; min-height:140px; max-height:300px; overflow:auto }
+label { color:#9fb2d4; font-size:14px }
+a.link { color:#7dd3fc; text-decoration:none }
 </style>
 <h1>AI Voice Agent</h1>
 
@@ -863,7 +862,7 @@ a.link {{ color:#7dd3fc; text-decoration:none }}
 </div>
 
 <script>
-(() => {{
+(() => {
   const statusEl = document.getElementById('status');
   const logEl = document.getElementById('log');
   const player = document.getElementById('player');
@@ -874,101 +873,99 @@ a.link {{ color:#7dd3fc; text-decoration:none }}
   const stopBtn = document.getElementById('stopBtn');
   const disconnectBtn = document.getElementById('disconnectBtn');
 
-  let ws = null, stream = null, recorder = null, recTimer = null, speech = null;
+  let ws = null, stream = null, recorder = null, speech = null;
 
-  function log(msg, obj){{
+  function log(msg, obj){
     const s = (new Date()).toLocaleTimeString() + " — " + msg + (obj? " " + JSON.stringify(obj): "");
     logEl.textContent += s + "\\n";
     logEl.scrollTop = logEl.scrollHeight;
-  }}
-  function setStatus(s){{ statusEl.textContent = s; }}
+  }
+  function setStatus(s){ statusEl.textContent = s; }
 
-  function wsUrl(){{
+  function wsUrl(){
     const proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
     return proto + location.host + '/ws/voice';
-  }}
+  }
 
-  function keepAlive(){{
-    if(ws && ws.readyState === WebSocket.OPEN){{
-      ws.send(JSON.stringify({{type:'ping'}}));
-    }}
-  }}
+  function keepAlive(){
+    if(ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify({type:'ping'}));
+    }
+  }
   setInterval(keepAlive, 20000);
 
-  function enableControls(connected){{
+  function enableControls(connected){
     connectBtn.disabled = connected;
     startBtn.disabled = !connected;
     stopBtn.disabled = true;
     disconnectBtn.disabled = !connected;
-  }}
+  }
 
-  connectBtn.onclick = () => {{
+  connectBtn.onclick = () => {
     if(ws && ws.readyState === WebSocket.OPEN) return;
     ws = new WebSocket(wsUrl());
     ws.binaryType = 'arraybuffer';
     setStatus('Connecting');
-    ws.onopen = () => {{ setStatus('Connected'); log('WS open'); enableControls(true); }};
-    ws.onclose = ev => {{
-      setStatus('Disconnected'); log('WS close', {{code: ev.code, reason: ev.reason}});
+    ws.onopen = () => { setStatus('Connected'); log('WS open'); enableControls(true); };
+    ws.onclose = ev => {
+      setStatus('Disconnected'); log('WS close', {code: ev.code, reason: ev.reason});
       if(recorder && recorder.state !== 'inactive') recorder.stop();
-      if(stream) {{ stream.getTracks().forEach(t=>t.stop()); stream = null; }}
-      if(speech) try{{ speech.stop(); }}catch(e){{}}
+      if(stream) { stream.getTracks().forEach(t=>t.stop()); stream = null; }
+      if(speech) try{ speech.stop(); }catch(e){}
       enableControls(false);
-    }};
-    ws.onerror = () => {{ log('WS error'); }};
-    ws.onmessage = ev => {{
-      try {{
+    };
+    ws.onerror = () => { log('WS error'); };
+    ws.onmessage = ev => {
+      try {
         const msg = JSON.parse(ev.data);
         if(msg.type === 'heartbeat') setStatus('Connected (heartbeat)');
         else if(msg.type === 'listening') setStatus('Listening…');
-        else if(msg.type === 'response'){{
+        else if(msg.type === 'response'){
           setStatus('Responded');
           log('Agent: ' + msg.text + ' (conf=' + (msg.confidence ?? 0).toFixed(2) + ')');
-          if(msg.audio_b64 && msg.audio_mime){{
+          if(msg.audio_b64 && msg.audio_mime){
             player.src = 'data:' + msg.audio_mime + ';base64,' + msg.audio_b64;
             player.play().catch(()=>{});
-          }}
-        }} else if(msg.type === 'transfer'){{ setStatus('Transfer'); log('Transfer: ' + msg.message); }}
-        else if(msg.type === 'error'){{ setStatus('Error'); log('Server error: ' + msg.message); }}
-        else if(msg.type === 'closing'){{ setStatus('Closing: ' + (msg.reason||'')); }}
-        else {{ log('Recv', msg); }}
-      }} catch(e) {{ log('Non-JSON message'); }}
-    }};
-  }};
+          }
+        } else if(msg.type === 'transfer'){ setStatus('Transfer'); log('Transfer: ' + msg.message); }
+        else if(msg.type === 'error'){ setStatus('Error'); log('Server error: ' + msg.message); }
+        else if(msg.type === 'closing'){ setStatus('Closing: ' + (msg.reason||'')); }
+        else { log('Recv', msg); }
+      } catch(e) { log('Non-JSON message'); }
+    };
+  };
 
-  startBtn.onclick = async () => {{
-    if(!ws || ws.readyState !== WebSocket.OPEN) {{ log('WS not open'); return; }}
+  startBtn.onclick = async () => {
+    if(!ws || ws.readyState !== WebSocket.OPEN) { log('WS not open'); return; }
     const useBrowser = useBrowserSTT.checked;
 
-    if(useBrowser){{
-      // Browser STT via Web Speech API
+    if(useBrowser){
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if(!SR) {{
+      if(!SR) {
         alert('Web Speech API not supported. Disable "Use Browser STT" or use Chrome.');
         return;
-      }}
+      }
       speech = new SR();
       speech.lang = 'en-US';
       speech.interimResults = true;
       speech.continuous = true;
-      speech.onresult = (e) => {{
+      speech.onresult = (e) => {
         let finalText = '';
-        for(let i=e.resultIndex; i<e.results.length; i++) {{
+        for(let i=e.resultIndex; i<e.results.length; i++) {
           if(e.results[i].isFinal) finalText += e.results[i][0].transcript;
-        }}
-        if(finalText.trim() && ws && ws.readyState === WebSocket.OPEN){{
-          ws.send(JSON.stringify({{type:'text', text: finalText}}));
-        }}
-      }};
+        }
+        if(finalText.trim() && ws && ws.readyState === WebSocket.OPEN){
+          ws.send(JSON.stringify({type:'text', text: finalText}));
+        }
+      };
       speech.onerror = (e)=> log('Speech error: ' + e.error);
       speech.onend = ()=> log('Speech end');
-      try {{ speech.start(); setStatus('Browser STT Running'); }}
-      catch(err){{ log('Speech start failed: ' + err); }}
+      try { speech.start(); setStatus('Browser STT Running'); }
+      catch(err){ log('Speech start failed: ' + err); }
       startBtn.disabled = true; stopBtn.disabled = false; disconnectBtn.disabled = false;
       return;
-    }}
+    }
 
-    // Server STT via MediaRecorder
     if(!navigator.mediaDevices || !window.MediaRecorder){
       alert('MediaRecorder not supported in this browser.');
       return;
@@ -981,16 +978,16 @@ a.link {{ color:#7dd3fc; text-decoration:none }}
       recorder.ondataavailable = async (e) => {
         if(e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN){
           const buf = await e.data.arrayBuffer();
-          ws.send(buf); // binary frames
+          ws.send(buf);
         }
       };
-      recorder.start(1000); // ~1s chunks; server batches to ~4s per STT
+      recorder.start(1000);
       setStatus('Recording'); startBtn.disabled = true; stopBtn.disabled = false; disconnectBtn.disabled = false;
       log('Recorder started with mime=' + (mime||'default'));
     } catch(err){
       log('getUserMedia error: ' + err);
     }
-  }};
+  };
 
   stopBtn.onclick = () => {
     if(recorder && recorder.state !== 'inactive') recorder.stop();
@@ -1005,10 +1002,11 @@ a.link {{ color:#7dd3fc; text-decoration:none }}
     if(speech) try{ speech.stop(); }catch(e){}
     if(ws){ ws.close(1000, 'client_close'); }
   };
-}})();
+})();
 </script>
 </html>
 """)
+
 
 # ------------------------------------------------------------------------------
 # Admin UI (/admin) – dev-only, no auth (your call)
