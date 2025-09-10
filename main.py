@@ -187,6 +187,7 @@ class ConnectionTracker:
         self.active = set()
         self.lock = threading.Lock()
 
+
     def add(self, conn_id: str) -> bool:
         with self.lock:
             if len(self.active) >= self.max_connections:
