@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI Voice Agent – Final Production + Full UI
+AI Voice Agent – Final Production + Full UI (known-good)
 - Async-safe (aiosqlite + threadpools for blocking ops)
 - Truthful audio MIME (gTTS -> MP3)
 - Buffered WS audio with size caps and timeouts
@@ -34,7 +34,6 @@ from contextlib import asynccontextmanager
 
 import aiosqlite
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
-
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -56,8 +55,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)5s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("voice_agent")
-AI_UNAVAILABLE_MSG = "Sorry—our AI is temporarily unavailable. I can transfer you to a person or try again in a moment."
 
+AI_UNAVAILABLE_MSG = (
+    "Sorry—our AI is temporarily unavailable. I can transfer you to a person or try again in a moment."
+)
 
 # ------------------------------------------------------------------------------
 # Config
@@ -266,7 +267,7 @@ class CircuitBreaker:
         self.success_count = 0
         self.opened_at: Optional[float] = None
         self.half_open_calls = 0
-        self.lock = threading.Lock()
+               self.lock = threading.Lock()
 
     def can_call(self) -> bool:
         with self.lock:
@@ -287,7 +288,6 @@ class CircuitBreaker:
                     self.half_open_calls += 1
                     return True
                 return False
-            return False
 
     def record_success(self):
         with self.lock:
@@ -508,7 +508,6 @@ class LightweightAIEngine:
     def breakers_status(self) -> Dict[str, Any]:
         return {"stt": self.cb_stt.status(), "chat": self.cb_chat.status()}
 
-
 # ------------------------------------------------------------------------------
 # Database (aiosqlite)
 # ------------------------------------------------------------------------------
@@ -715,7 +714,7 @@ class KnowledgeBaseManager:
         return best
 
 # ------------------------------------------------------------------------------
-# Scraper (guarded, async)
+# Scraper (guarded, async) with Q&A + fallback summaries
 # ------------------------------------------------------------------------------
 class WebScraper:
     def __init__(self, allowed_hosts: set[str], max_pages: int = 40, timeout: int = 10):
@@ -738,6 +737,8 @@ class WebScraper:
         seen = set()
         queue = [base_url]
 
+        logger.info(f"Scrape requested: {base_url}")
+
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             while queue and len(seen) < self.max_pages:
                 url = queue.pop(0)
@@ -749,9 +750,20 @@ class WebScraper:
                     if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
                         continue
                     soup = BeautifulSoup(r.text, "html.parser")
-                    # Extract Q&A by simple heuristic
+
+                    page_title = (soup.title.string.strip() if soup.title and soup.title.string else "").strip()
                     text = self._clean_text(soup.get_text(" "))
-                    results += self._extract_qa(text, url)
+
+                    # Q&A first
+                    qa = self._extract_qa(text, url)
+                    if qa:
+                        results += qa
+                    else:
+                        # Fallback summary item so you always get something
+                        summary = self._summary_from_text(text, 600)
+                        if summary:
+                            q = f"{page_title or 'Page'} – summary"
+                            results.append({"question": q[:200], "answer": summary, "source": url})
 
                     # enqueue same-site links
                     for a in soup.find_all("a", href=True):
@@ -761,6 +773,8 @@ class WebScraper:
                             queue.append(next_url)
                 except Exception as e:
                     logger.warning(f"Scrape error at {url}: {e}")
+
+        logger.info(f"Scrape finished: {base_url} -> items={len(results)}, pages_scanned={len(seen)}")
         return results
 
     def _clean_text(self, t: str) -> str:
@@ -768,7 +782,10 @@ class WebScraper:
         return " ".join([ln for ln in lines if ln])
 
     def _extract_qa(self, text: str, source: str) -> List[Dict[str,str]]:
+        """Very simple heuristic: split on '? ' and treat trailing sentence as answer."""
         out: List[Dict[str,str]] = []
+        if "?" not in text:
+            return out
         parts = [p.strip() for p in text.split("? ") if p.strip()]
         for p in parts:
             if len(p) < 15:
@@ -780,6 +797,26 @@ class WebScraper:
             if len(a) > 15 and len(a) < 500:
                 out.append({"question": q, "answer": a, "source": source})
         return out
+
+    def _summary_from_text(self, text: str, max_len: int = 600) -> str:
+        """Grab the first meaningful chunk of text as a summary."""
+        if not text:
+            return ""
+        # prefer sentences; naive split
+        sentences = [s.strip() for s in text.split(". ") if s.strip()]
+        buf = []
+        total = 0
+        for s in sentences:
+            if len(s) < 5:
+                continue
+            if total + len(s) + 2 > max_len:
+                break
+            buf.append(s)
+            total += len(s) + 2
+            if total > max_len * 0.6:
+                break
+        out = ". ".join(buf).strip()
+        return out[:max_len] if out else text[:max_len]
 
 # ------------------------------------------------------------------------------
 # App wiring
@@ -806,7 +843,6 @@ async def lifespan(app: FastAPI):
         base_url = f"http://localhost:{eff_port}"
         ws_url   = f"ws://localhost:{eff_port}/ws/voice"
 
-    # Optional: override Config.BASE_URL at runtime if you want downstream code to see it:
     try:
         Config.BASE_URL = base_url
     except Exception:
@@ -819,27 +855,21 @@ async def lifespan(app: FastAPI):
     logger.info("Startup complete.")
 
     yield
-    # no special shutdown
-
 
 app = FastAPI(
     title="AI Voice Agent System - Final Production",
-    version="1.7.0",
+    version="1.7.1",
     lifespan=lifespan
 )
-
-
 
 @app.head("/", include_in_schema=False)
 def root_head():
     return Response(status_code=200)
-  
+
 # Move JSON health to /healthz
 @app.get("/healthz", include_in_schema=False)
 def healthz():
     return {"status": "ok"}
-
-
 
 # CORS
 app.add_middleware(
@@ -861,9 +891,7 @@ async def index():
 <title>AI Voice Agent</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root {
-  --bg:#0f172a; --fg:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --btn:#1e40af; --btn2:#0891b2;
-}
+:root { --bg:#0f172a; --fg:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --btn:#1e40af; --btn2:#0891b2; }
 * { box-sizing:border-box }
 body { background:var(--bg); color:var(--fg); font:16px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:0; padding:24px }
 h1 { margin:0 0 12px 0 }
@@ -1052,7 +1080,6 @@ a.link { color:#7dd3fc; text-decoration:none }
 </html>
 """)
 
-
 # ------------------------------------------------------------------------------
 # Admin UI (/admin) – dev-only, no auth (your call)
 # ------------------------------------------------------------------------------
@@ -1130,8 +1157,8 @@ async function scrape(){
       body: JSON.stringify({url})
     });
     const text = await r.text();
-    const msg = `Finished in ${((Date.now()-t0)/1000).toFixed(1)}s\n` +
-                (r.ok ? text : `HTTP ${r.status}\n${text}`);
+    const msg = `Finished in ${((Date.now()-t0)/1000).toFixed(1)}s\\n` +
+                (r.ok ? text : `HTTP ${r.status}\\n${text}`);
     outEl.textContent = msg;
   } catch (e) {
     outEl.textContent = `Network error: ${String(e)}`;
@@ -1155,7 +1182,7 @@ async function loadUnknowns(){
   const div = document.getElementById('unknowns');
   if(!j.questions || !j.questions.length){ div.innerHTML = '<div class="muted">None</div>'; return; }
   div.innerHTML = '<table><tr><th>Time</th><th>Question</th><th>Suggested</th><th></th></tr>' +
-    j.questions.map(q => '<tr><td>'+ (q.timestamp||'') +'</td><td>'+ (q.question||'') +'</td><td>'+ (q.suggested_answer||'') +'</td><td><button onclick="resolveUnknown(\''+q.id+'\')">Resolve</button></td></tr>').join('') +
+    j.questions.map(q => '<tr><td>'+ (q.timestamp||'') +'</td><td>'+ (q.question||'') +'</td><td>'+ (q.suggested_answer||'') +'</td><td><button onclick="resolveUnknown(\\''+q.id+'\\')">Resolve</button></td></tr>').join('') +
     '</table>';
 }
 
@@ -1182,8 +1209,6 @@ async def api_add_kb(payload: Dict[str, Any]):
     await knowledge_manager.add_knowledge_item(q, a, source="manual")
     return {"status":"success","message":"Knowledge item added"}
 
-
-
 @app.get("/debug/openai", include_in_schema=False)
 async def debug_openai():
     try:
@@ -1202,11 +1227,7 @@ async def debug_openai():
         txt = (resp.choices[0].message.content or "").strip()
         return {"ok": True, "model": Config.OPENAI_CHAT_MODEL, "reply": txt[:100]}
     except Exception as e:
-        # expose full detail so we see the cause
         return {"ok": False, "error": repr(e)}
-
-
-
 
 @app.post("/api/knowledge/scrape")
 async def api_scrape(payload: Dict[str, Any]):
@@ -1225,18 +1246,16 @@ async def api_scrape(payload: Dict[str, Any]):
         pages = len({x.get("source") for x in qa}) or 0
         if added == 0:
             return {"status":"success","message":"Scrape completed, but no Q&A patterns were found","pages_scanned": pages}
-        return {"status":"success","message":f"Scraped {len(qa)} Q&A; added {added}","pages_scanned": pages}
+        return {"status":"success","message":f"Scraped {len(qa)} items; added {added}","pages_scanned": pages}
     except ValueError as ve:
         return JSONResponse({"status":"error","message":str(ve)}, status_code=400)
     except Exception:
         logger.exception("Scrape failed")
         return JSONResponse({"status":"error","message":"scrape_failed"}, status_code=500)
 
-
 @app.get("/api/knowledge/unknown")
 async def api_unknown():
     qs = await db_manager.get_unknown_questions(resolved=False)
-    # convert datetimes to iso
     out = []
     for q in qs:
         out.append({
@@ -1255,16 +1274,13 @@ async def api_resolve(payload: Dict[str, Any]):
     ans = (payload.get("answer") or "").strip()
     if not qid or not ans:
         return JSONResponse({"status":"error","message":"question_id and answer required"}, status_code=400)
-    # find unknown question
     unknowns = await db_manager.get_unknown_questions(resolved=False)
     target = next((u for u in unknowns if u.id == qid), None)
     if not target:
         return JSONResponse({"status":"error","message":"unknown_question_not_found"}, status_code=404)
 
-    # add to KB
     await knowledge_manager.add_knowledge_item(target.question, ans, source="resolved")
 
-    # mark resolved
     async with aiosqlite.connect(Config.DATABASE_PATH) as conn:
         await conn.execute("UPDATE unknown_questions SET resolved = 1 WHERE id = ?", (qid,))
         await conn.commit()
@@ -1278,13 +1294,11 @@ async def api_stats():
 # ------------------------------------------------------------------------------
 # WebSocket voice endpoint – accepts binary frames and JSON text
 # ------------------------------------------------------------------------------
-
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
     await websocket.accept()
     call_id = f"call_{uuid4().hex}"
 
-    # Global capacity cap
     if not connection_tracker.add(call_id):
         await websocket.send_json({"type": "error", "message": "Server at capacity. Try again later."})
         await websocket.close(code=1013)
@@ -1297,8 +1311,6 @@ async def voice_websocket(websocket: WebSocket):
         logger.info(f"Call started: {call_id} (active={connection_tracker.count()})")
 
         start_ts = time.monotonic()
-
-        # Per-IP limiter
         client_ip = websocket.client.host if websocket.client else "unknown"
         if not rate_limiter.is_allowed(client_ip):
             await websocket.send_json({"type": "error", "message": "Rate limit exceeded for your IP."})
@@ -1310,14 +1322,12 @@ async def voice_websocket(websocket: WebSocket):
         last_process_time = time.monotonic()
 
         while True:
-            # Duration limit
             if time.monotonic() - start_ts > Config.MAX_CALL_DURATION:
                 await websocket.send_json({"type": "closing", "reason": "max_duration"})
                 await websocket.close(code=1000)
                 call.outcome = call.outcome or "answered"
                 break
 
-            # Receive a frame (text OR bytes) with timeout
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=Config.WEBSOCKET_TIMEOUT)
             except asyncio.TimeoutError:
@@ -1327,11 +1337,10 @@ async def voice_websocket(websocket: WebSocket):
                 logger.warning(f"Receive error ({call_id}): {e}")
                 break
 
-            # Handle client close
             if msg.get("type") == "websocket.disconnect":
                 break
 
-            # ---- TEXT FRAME PATH (browser STT / control messages) ----
+            # TEXT frames (browser STT / control)
             if "text" in msg and msg["text"] is not None:
                 try:
                     payload = json.loads(msg["text"])
@@ -1350,13 +1359,11 @@ async def voice_websocket(websocket: WebSocket):
 
                     call.transcript += f"User: {text}\n"
 
-                    # KB lookup
                     answer, confidence, item_id = await knowledge_manager.find_answer(text)
                     if confidence >= Config.CONFIDENCE_THRESHOLD:
                         response_text = answer
                         call.outcome = call.outcome or "answered"
                     else:
-                        # human escalation?
                         if any(k in text.lower() for k in
                                ["human", "person", "agent", "representative", "manager", "supervisor", "help me", "speak to someone"]):
                             await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
@@ -1364,11 +1371,8 @@ async def voice_websocket(websocket: WebSocket):
                             await websocket.close(code=1000)
                             call.outcome = "transferred"
                             break
-
-                        # LLM response
                         response_text = await ai_engine.generate_response(text)
 
-                        # Record unknown for later curation
                         uq = UnknownQuestion(
                             id=f"unknown_{uuid4().hex}",
                             question=text,
@@ -1376,12 +1380,12 @@ async def voice_websocket(websocket: WebSocket):
                             timestamp=now_utc(),
                             suggested_answer=response_text
                         )
-                        await db_manager.save_unknown_question(uq)
+                        if response_text != AI_UNAVAILABLE_MSG:
+                            await db_manager.save_unknown_question(uq)
 
                     call.transcript += f"Agent: {response_text}\n"
                     call.confidence_score = confidence
 
-                    # TTS (always generated on server so the user hears something)
                     audio_bytes = await ai_engine.text_to_speech(response_text)
 
                     await websocket.send_json({
@@ -1391,13 +1395,12 @@ async def voice_websocket(websocket: WebSocket):
                         "audio_mime": Config.AUDIO_TTS_MIME,
                         "confidence": confidence
                     })
-                    continue  # done with text frame
+                    continue
 
-                # Unknown control message
                 await websocket.send_json({"type": "error", "message": "unrecognized_control_message"})
                 continue
 
-            # ---- BINARY FRAME PATH (mic audio) ----
+            # BINARY frames (mic audio)
             data: Optional[bytes] = msg.get("bytes")
             if not data:
                 await websocket.send_json({"type": "noop"})
@@ -1407,7 +1410,6 @@ async def voice_websocket(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "audio_frame_too_large"})
                 continue
 
-            # Buffer frames safely (batching)
             async with buffer_lock:
                 audio_buffer.append(data)
                 should_process = (
@@ -1423,14 +1425,12 @@ async def voice_websocket(websocket: WebSocket):
 
             if not batch:
                 continue
-
             if len(batch) > Config.MAX_COMBINED_AUDIO:
                 await websocket.send_json({"type": "error", "message": "audio_combination_too_large"})
                 continue
 
             logger.info(f"STT batch bytes={len(batch)}")
 
-            # STT
             text = await ai_engine.speech_to_text(batch)
             logger.info(f"STT text='{text}'")
             if not text:
@@ -1439,13 +1439,11 @@ async def voice_websocket(websocket: WebSocket):
 
             call.transcript += f"User: {text}\n"
 
-            # KB lookup
             answer, confidence, item_id = await knowledge_manager.find_answer(text)
             if confidence >= Config.CONFIDENCE_THRESHOLD:
                 response_text = answer
                 call.outcome = call.outcome or "answered"
             else:
-                # human escalation?
                 if any(k in text.lower() for k in
                        ["human", "person", "agent", "representative", "manager", "supervisor", "help me", "speak to someone"]):
                     await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
@@ -1453,27 +1451,23 @@ async def voice_websocket(websocket: WebSocket):
                     await websocket.close(code=1000)
                     call.outcome = "transferred"
                     break
-            
-                # LLM response (may return outage string on 429/quota)
                 response_text = await ai_engine.generate_response(text)
-            
-            # Log unknown only if we produced a real AI answer
-            if response_text != AI_UNAVAILABLE_MSG:
-                uq = UnknownQuestion(
-                    id=f"unknown_{uuid4().hex}",
-                    question=text,
-                    call_id=call_id,
-                    timestamp=now_utc(),
-                    suggested_answer=response_text
-                )
-                await db_manager.save_unknown_question(uq)
-            
-            # ALWAYS send a response (even the outage message)
+
+                if response_text != AI_UNAVAILABLE_MSG:
+                    uq = UnknownQuestion(
+                        id=f"unknown_{uuid4().hex}",
+                        question=text,
+                        call_id=call_id,
+                        timestamp=now_utc(),
+                        suggested_answer=response_text
+                    )
+                    await db_manager.save_unknown_question(uq)
+
             call.transcript += f"Agent: {response_text}\n"
             call.confidence_score = confidence
-            
+
             audio_bytes = await ai_engine.text_to_speech(response_text)
-            
+
             await websocket.send_json({
                 "type": "response",
                 "text": response_text,
@@ -1481,7 +1475,6 @@ async def voice_websocket(websocket: WebSocket):
                 "audio_mime": Config.AUDIO_TTS_MIME,
                 "confidence": confidence
             })
-
 
     except WebSocketDisconnect:
         logger.info(f"Call disconnected: {call_id}")
