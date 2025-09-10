@@ -175,14 +175,18 @@ CONTRACTIONS = {
 
 def normalize_text(s: str) -> str:
     s = (s or "").lower().strip()
-    # expand contractions (simple pass)
+    # normalize curly quotes to ASCII
+    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    # expand common contractions
     for k, v in CONTRACTIONS.items():
         s = s.replace(k, v)
-    # remove punctuation -> spaces
+    # fallback: “whats” -> “what is” (no apostrophe)
+    s = re.sub(r"\bwhats\b", "what is", s)
+    # strip punctuation and collapse whitespace
     s = re.sub(r"[^a-z0-9\s]", " ", s)
-    # collapse whitespace
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 def jaccard_tokens(a: str, b: str) -> float:
     ta, tb = set(a.split()), set(b.split())
@@ -849,22 +853,20 @@ class WebScraper:
         lines = [ln.strip() for ln in t.splitlines()]
         return " ".join([ln for ln in lines if ln])
 
-    def _extract_qa(self, text: str, source: str) -> List[Dict[str, str]]:
-        """Very simple heuristic: split on '? ' and treat trailing sentence as answer."""
-        out: List[Dict[str, str]] = []
-        if "?" not in text:
-            return out
-        parts = [p.strip() for p in text.split("? ") if p.strip()]
-        for p in parts:
-            if len(p) < 15:
-                continue
-            if " " not in p:
-                continue
-            q = p.split(" ")[0] + "?"
-            a = p[len(q):].strip()
-            if len(a) > 15 and len(a) < 500:
+def _extract_qa(self, text: str, source: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    # split on sentence boundaries
+    sentences = re.split(r'(?<=[\.\!\?])\s+', text)
+    for i, s in enumerate(sentences):
+        s = s.strip()
+        if s.endswith("?") and i + 1 < len(sentences):
+            q = s
+            a = sentences[i + 1].strip()
+            # keep only reasonable lengths
+            if 8 < len(q) < 200 and 15 < len(a) < 500:
                 out.append({"question": q, "answer": a, "source": source})
-        return out
+    return out
+
 
     def _summary_from_text(self, text: str, max_len: int = 600) -> str:
         """Grab the first meaningful chunk of text as a summary."""
