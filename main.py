@@ -788,7 +788,7 @@ class KnowledgeBaseManager:
 # ------------------------------------------------------------------------------
 # Scraper (guarded, async) with Q&A + fallback summaries
 # ------------------------------------------------------------------------------
-class class WebScraper:
+class WebScraper:
     def __init__(self, allowed_hosts: set[str], max_pages: int = 40, timeout: int = 10):
         self.allowed_hosts = allowed_hosts
         self.max_pages = max_pages
