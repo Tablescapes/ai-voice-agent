@@ -26,6 +26,9 @@ import threading
 import json
 import uvicorn
 import csv, io
+import re
+from difflib import SequenceMatcher
+
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
@@ -93,7 +96,7 @@ class Config:
     AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "4"))            # frames per STT batch
 
     # KB / matching
-    SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.30"))
+    SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.25"))
     CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
 
     # Call control
@@ -162,6 +165,31 @@ class UnknownQuestion:
 # ------------------------------------------------------------------------------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+CONTRACTIONS = {
+    "what's": "what is", "who's": "who is", "where's": "where is",
+    "i'm": "i am", "you're": "you are", "it's": "it is",
+    "we're": "we are", "they're": "they are", "can't": "cannot",
+    "won't": "will not", "don't": "do not", "doesn't": "does not"
+}
+
+def normalize_text(s: str) -> str:
+    s = (s or "").lower().strip()
+    # expand contractions (simple pass)
+    for k, v in CONTRACTIONS.items():
+        s = s.replace(k, v)
+    # remove punctuation -> spaces
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def jaccard_tokens(a: str, b: str) -> float:
+    ta, tb = set(a.split()), set(b.split())
+    if not ta and not tb: return 1.0
+    if not ta or not tb:  return 0.0
+    return len(ta & tb) / len(ta | tb)
+
 
 def today_utc_range() -> Tuple[str, str]:
     start = datetime.now(timezone.utc).date()
@@ -733,16 +761,19 @@ class KnowledgeBaseManager:
     async def find_answer(self, question: str) -> Tuple[str, float, Optional[str]]:
         if not self.knowledge_items:
             return "", 0.0, None
-        q_words = set(question.lower().split())
+
+        q_norm = normalize_text(question)
         best: Tuple[str, float, Optional[str]] = ("", 0.0, None)
 
         for it in self.knowledge_items:
-            it_words = set((it.question or "").lower().split())
-            if not it_words:
-                continue
-            inter = q_words.intersection(it_words)
-            union = q_words.union(it_words)
-            sim = len(inter) / len(union) if union else 0.0
+            it_norm = normalize_text(it.question)
+            # Token overlap
+            j = jaccard_tokens(q_norm, it_norm)
+            # Fuzzy character similarity
+            s = SequenceMatcher(None, q_norm, it_norm).ratio()
+            # Combine: take the stronger signal (slightly weight fuzzy)
+            sim = max(j, s * 0.9)
+
             if sim > best[1] and sim >= Config.SIMILARITY_THRESHOLD:
                 best = (it.answer, sim, it.id)
 
