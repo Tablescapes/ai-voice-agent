@@ -23,6 +23,7 @@ import subprocess
 import time
 import threading
 import json
+import uvicorn
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -1181,6 +1182,9 @@ async def api_stats():
 # ------------------------------------------------------------------------------
 # WebSocket voice endpoint – accepts binary frames and JSON text
 # ------------------------------------------------------------------------------
+from typing import Optional, List, Dict, Any, Tuple
+import json
+
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
     await websocket.accept()
@@ -1219,7 +1223,7 @@ async def voice_websocket(websocket: WebSocket):
                 call.outcome = call.outcome or "answered"
                 break
 
-            # Receive either text (JSON) or binary
+            # Receive a frame (text OR bytes) with timeout
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=Config.WEBSOCKET_TIMEOUT)
             except asyncio.TimeoutError:
@@ -1229,16 +1233,16 @@ async def voice_websocket(websocket: WebSocket):
                 logger.warning(f"Receive error ({call_id}): {e}")
                 break
 
-            if "type" in msg and msg["type"] == "websocket.disconnect":
+            # Handle client close
+            if msg.get("type") == "websocket.disconnect":
                 break
 
-            # JSON text message
+            # ---- TEXT FRAME PATH (browser STT / control messages) ----
             if "text" in msg and msg["text"] is not None:
                 try:
                     payload = json.loads(msg["text"])
                 except Exception:
-                    await websocket.send_json({"type": "error", "message": "invalid_json"})
-                    continue
+                    payload = {"type": "text", "text": msg["text"]}
 
                 if payload.get("type") == "ping":
                     await websocket.send_json({"type": "heartbeat"})
@@ -1249,15 +1253,16 @@ async def voice_websocket(websocket: WebSocket):
                     if not text:
                         await websocket.send_json({"type": "listening"})
                         continue
+
                     call.transcript += f"User: {text}\n"
 
                     # KB lookup
                     answer, confidence, item_id = await knowledge_manager.find_answer(text)
-
                     if confidence >= Config.CONFIDENCE_THRESHOLD:
                         response_text = answer
                         call.outcome = call.outcome or "answered"
                     else:
+                        # human escalation?
                         if any(k in text.lower() for k in
                                ["human", "person", "agent", "representative", "manager", "supervisor", "help me", "speak to someone"]):
                             await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
@@ -1266,8 +1271,10 @@ async def voice_websocket(websocket: WebSocket):
                             call.outcome = "transferred"
                             break
 
+                        # LLM response
                         response_text = await ai_engine.generate_response(text)
 
+                        # Record unknown for later curation
                         uq = UnknownQuestion(
                             id=f"unknown_{uuid4().hex}",
                             question=text,
@@ -1280,7 +1287,9 @@ async def voice_websocket(websocket: WebSocket):
                     call.transcript += f"Agent: {response_text}\n"
                     call.confidence_score = confidence
 
+                    # TTS (always generated on server so the user hears something)
                     audio_bytes = await ai_engine.text_to_speech(response_text)
+
                     await websocket.send_json({
                         "type": "response",
                         "text": response_text,
@@ -1288,14 +1297,14 @@ async def voice_websocket(websocket: WebSocket):
                         "audio_mime": Config.AUDIO_TTS_MIME,
                         "confidence": confidence
                     })
-                    continue
+                    continue  # done with text frame
 
-                # Unknown JSON type
-                await websocket.send_json({"type":"error","message":"unknown_json_type"})
+                # Unknown control message
+                await websocket.send_json({"type": "error", "message": "unrecognized_control_message"})
                 continue
 
-            # Binary audio frame
-            data = msg.get("bytes")
+            # ---- BINARY FRAME PATH (mic audio) ----
+            data: Optional[bytes] = msg.get("bytes")
             if not data:
                 await websocket.send_json({"type": "noop"})
                 continue
@@ -1304,12 +1313,12 @@ async def voice_websocket(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "audio_frame_too_large"})
                 continue
 
-            # Buffer frames safely
+            # Buffer frames safely (batching)
             async with buffer_lock:
                 audio_buffer.append(data)
                 should_process = (
                     len(audio_buffer) >= Config.AUDIO_BUFFER_SIZE or
-                    (time.monotonic() - last_process_time) > 2.5
+                    (time.monotonic() - last_process_time) > 2.0
                 )
                 if should_process:
                     batch = b"".join(audio_buffer)
@@ -1321,14 +1330,15 @@ async def voice_websocket(websocket: WebSocket):
             if not batch:
                 continue
 
-            # Combined size check
             if len(batch) > Config.MAX_COMBINED_AUDIO:
                 await websocket.send_json({"type": "error", "message": "audio_combination_too_large"})
                 continue
 
             logger.info(f"STT batch bytes={len(batch)}")
-            # STT (server-side)
+
+            # STT
             text = await ai_engine.speech_to_text(batch)
+            logger.info(f"STT text='{text}'")
             if not text:
                 await websocket.send_json({"type": "listening"})
                 continue
@@ -1337,7 +1347,6 @@ async def voice_websocket(websocket: WebSocket):
 
             # KB lookup
             answer, confidence, item_id = await knowledge_manager.find_answer(text)
-
             if confidence >= Config.CONFIDENCE_THRESHOLD:
                 response_text = answer
                 call.outcome = call.outcome or "answered"
@@ -1351,6 +1360,7 @@ async def voice_websocket(websocket: WebSocket):
                     break
 
                 response_text = await ai_engine.generate_response(text)
+
                 uq = UnknownQuestion(
                     id=f"unknown_{uuid4().hex}",
                     question=text,
@@ -1364,6 +1374,7 @@ async def voice_websocket(websocket: WebSocket):
             call.confidence_score = confidence
 
             audio_bytes = await ai_engine.text_to_speech(response_text)
+
             await websocket.send_json({
                 "type": "response",
                 "text": response_text,
