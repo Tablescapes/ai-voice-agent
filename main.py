@@ -56,6 +56,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)5s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("voice_agent")
+AI_UNAVAILABLE_MSG = "Sorry—our AI is temporarily unavailable. I can transfer you to a person or try again in a moment."
+
 
 # ------------------------------------------------------------------------------
 # Config
@@ -421,11 +423,6 @@ class LightweightAIEngine:
         logger.info(f"STT text='{text}'")
         return text
 
-
-
-
-
-
     def _tts_sync(self, text: str) -> bytes:
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "tts.mp3"
@@ -447,51 +444,54 @@ class LightweightAIEngine:
             logger.error(f"TTS error: {e}")
             return b""
 
-async def generate_response(self, user_input: str, context: str = "") -> str:
-    """LLM response or rule-based fallback, guarded by circuit breaker."""
-    user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
+    async def generate_response(self, user_input: str, context: str = "") -> str:
+        """LLM response or rule-based fallback, guarded by circuit breaker."""
+        user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
 
-    if self.openai_client and self.cb_chat.can_call():
-        try:
-            resp = await run_in_threadpool(
-                self._sync_openai_chat,
-                [
-                    {"role": "system",
-                     "content": f"You are a concise customer service agent for a tableware and event-rental business. Keep answers accurate and succinct. Context: {context}"},
-                    {"role": "user", "content": user_input}
-                ],
-                Config.OPENAI_CHAT_MODEL,
-                0.2,
-                220
-            )
-            text = (resp.choices[0].message.content or "").strip()
-            self.cb_chat.record_success()
-            if text:
-                return text
-        except Exception as e:
-            import traceback
-            self.cb_chat.record_failure()
-            logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
-            # If quota/rate-limits, return a clear, human-friendly line
-            s = str(e).lower()
-            if "insufficient_quota" in s or "429" in s or "rate limit" in s:
-                return AI_UNAVAILABLE_MSG
+        if self.openai_client and self.cb_chat.can_call():
+            try:
+                resp = await run_in_threadpool(
+                    self._sync_openai_chat,
+                    [
+                        {"role": "system",
+                         "content": (
+                             "You are a concise customer service agent for a tableware and "
+                             "event-rental business. Keep answers accurate and succinct. "
+                             f"Context: {context}"
+                         )},
+                        {"role": "user", "content": user_input}
+                    ],
+                    Config.OPENAI_CHAT_MODEL,
+                    0.2,
+                    220
+                )
+                text = (resp.choices[0].message.content or "").strip()
+                self.cb_chat.record_success()
+                if text:
+                    return text
+            except Exception as e:
+                import traceback
+                self.cb_chat.record_failure()
+                logger.error("Chat error after retries: %s\n%s", repr(e), traceback.format_exc())
+                s = str(e).lower()
+                if "insufficient_quota" in s or "429" in s or "rate limit" in s:
+                    return AI_UNAVAILABLE_MSG
 
-    # Fallback (rule-based)
-    u = (user_input or "").lower()
-    if any(w in u for w in ["hello", "hi", "hey", "good morning", "good afternoon"]):
-        return "Hello! How can I help you today?"
-    if any(w in u for w in ["help", "support", "question"]):
-        return "Sure—what do you need help with?"
-    if any(w in u for w in ["price", "cost", "pricing", "how much"]):
-        return "Which item do you want pricing for?"
-    if any(w in u for w in ["hours", "open", "closed"]):
-        return "Tell me which location and I’ll check hours."
-    if any(w in u for w in ["shipping", "delivery", "ship"]):
-        return "What would you like to know about delivery options?"
-    if any(w in u for w in ["return", "exchange", "refund"]):
-        return "Which item/order are you asking about?"
-    return "I can help with that. Could you clarify the item or topic?"
+        # Fallback (rule-based)
+        u = (user_input or "").lower()
+        if any(w in u for w in ["hello", "hi", "hey", "good morning", "good afternoon"]):
+            return "Hello! How can I help you today?"
+        if any(w in u for w in ["help", "support", "question"]):
+            return "Sure—what do you need help with?"
+        if any(w in u for w in ["price", "cost", "pricing", "how much"]):
+            return "Which item do you want pricing for?"
+        if any(w in u for w in ["hours", "open", "closed"]):
+            return "Tell me which location and I’ll check hours."
+        if any(w in u for w in ["shipping", "delivery", "ship"]):
+            return "What would you like to know about delivery options?"
+        if any(w in u for w in ["return", "exchange", "refund"]):
+            return "Which item/order are you asking about?"
+        return "I can help with that. Could you clarify the item or topic?"
 
     def get_embedding(self, text: str) -> List[float]:
         words = text.lower().split()
@@ -507,6 +507,7 @@ async def generate_response(self, user_input: str, context: str = "") -> str:
 
     def breakers_status(self) -> Dict[str, Any]:
         return {"stt": self.cb_stt.status(), "chat": self.cb_chat.status()}
+
 
 # ------------------------------------------------------------------------------
 # Database (aiosqlite)
@@ -1444,6 +1445,7 @@ async def voice_websocket(websocket: WebSocket):
                 response_text = answer
                 call.outcome = call.outcome or "answered"
             else:
+                # human escalation?
                 if any(k in text.lower() for k in
                        ["human", "person", "agent", "representative", "manager", "supervisor", "help me", "speak to someone"]):
                     await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
@@ -1451,36 +1453,35 @@ async def voice_websocket(websocket: WebSocket):
                     await websocket.close(code=1000)
                     call.outcome = "transferred"
                     break
+            
+                # LLM response (may return outage string on 429/quota)
+                response_text = await ai_engine.generate_response(text)
+            
+            # Log unknown only if we produced a real AI answer
+            if response_text != AI_UNAVAILABLE_MSG:
+                uq = UnknownQuestion(
+                    id=f"unknown_{uuid4().hex}",
+                    question=text,
+                    call_id=call_id,
+                    timestamp=now_utc(),
+                    suggested_answer=response_text
+                )
+                await db_manager.save_unknown_question(uq)
+            
+            # ALWAYS send a response (even the outage message)
+            call.transcript += f"Agent: {response_text}\n"
+            call.confidence_score = confidence
+            
+            audio_bytes = await ai_engine.text_to_speech(response_text)
+            
+            await websocket.send_json({
+                "type": "response",
+                "text": response_text,
+                "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
+                "audio_mime": Config.AUDIO_TTS_MIME,
+                "confidence": confidence
+            })
 
-        response_text = await ai_engine.generate_response(text)
-        
-        # Only log "unknown" if AI actually answered (not rate-limited)
-        response_text = await ai_engine.generate_response(text)
-        
-        # Only log "unknown" if AI actually answered (not rate-limited)
-        if response_text != AI_UNAVAILABLE_MSG:
-            uq = UnknownQuestion(
-                id=f"unknown_{uuid4().hex}",
-                question=text,
-                call_id=call_id,
-                timestamp=now_utc(),
-                suggested_answer=response_text
-            )
-            await db_manager.save_unknown_question(uq)
-        
-        # ALWAYS send the response (even the outage message)
-        call.transcript += f"Agent: {response_text}\n"
-        call.confidence_score = confidence
-        
-        audio_bytes = await ai_engine.text_to_speech(response_text)
-        
-        await websocket.send_json({
-            "type": "response",
-            "text": response_text,
-            "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
-            "audio_mime": Config.AUDIO_TTS_MIME,
-            "confidence": confidence
-        })
 
     except WebSocketDisconnect:
         logger.info(f"Call disconnected: {call_id}")
