@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-AI Voice Agent – Production + Full UI
+AI Voice Agent – Final Production + Full UI
 - Async-safe (aiosqlite + threadpools for blocking ops)
-- Truthful audio MIME (gTTS -> MP3) and tolerant playback
+- Truthful audio MIME (gTTS -> MP3)
 - Buffered WS audio with size caps and timeouts
 - Circuit breakers + retries for OpenAI calls
 - Monotonic, thread-safe rate limiting + global connection cap
 - Atomic DB updates and correct UTC date-range stats
-- Full inlined UI at '/' with tabs: Voice / Knowledge Base / Web Scraper
+- Full inlined UI at '/' (Voice / KB / Add Item / Scrape / Stats)
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
@@ -29,6 +29,9 @@ from dataclasses import dataclass
 from uuid import uuid4
 from pathlib import Path
 from collections import defaultdict
+from urllib.parse import urlparse, urljoin
+import urllib.request
+import urllib.error
 
 import aiosqlite
 from starlette.concurrency import run_in_threadpool
@@ -40,10 +43,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 from openai import OpenAI
 from gtts import gTTS
 
-# Scraper
-import httpx
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except Exception:
+    BS4_AVAILABLE = False
 
 
 # ------------------------------------------------------------------------------
@@ -62,7 +66,7 @@ logger = logging.getLogger("voice_agent")
 class Config:
     # OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
+    OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
     OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
     # CORS
@@ -78,9 +82,9 @@ class Config:
     SAMPLE_RATE = 16000
     STT_TARGET_RATE = 16000
     AUDIO_TTS_MIME = "audio/mpeg"  # gTTS -> MP3
-    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "5242880"))            # 5 MB per frame
-    MAX_COMBINED_AUDIO = int(os.getenv("MAX_COMBINED_AUDIO", "15728640"))   # 15 MB per batch
-    AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "1"))            # frames per STT batch (1 = immediate)
+    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "5242880"))           # 5 MB per frame
+    MAX_COMBINED_AUDIO = int(os.getenv("MAX_COMBINED_AUDIO", "15728640"))  # 15 MB per batch
+    AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "1"))           # frames per STT batch (1 = immediate)
 
     # KB / matching
     SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.30"))
@@ -88,7 +92,7 @@ class Config:
 
     # Call control
     MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "600"))     # seconds
-    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "6"))       # seconds
+    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "5"))       # seconds
 
     # Server
     HOST = os.getenv("HOST", "0.0.0.0")
@@ -105,9 +109,10 @@ class Config:
     CB_HALF_OPEN_LIMIT = int(os.getenv("CB_HALF_OPEN_LIMIT", "2"))
 
     # Scraper safety
-    ALLOWED_SCRAPE_HOSTS = set(h.strip().lower() for h in os.getenv(
+    # Comma-separated list of hostnames. If empty, allow any host (NOT recommended).
+    ALLOWED_SCRAPE_HOSTS = [h.strip().lower() for h in os.getenv(
         "ALLOWED_SCRAPE_HOSTS", "tablescapes.com,www.tablescapes.com"
-    ).split(",") if h.strip())
+    ).split(",") if h.strip()]
 
     # Misc
     MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "4000"))
@@ -372,7 +377,7 @@ class LightweightAIEngine:
         if len(data) > Config.MAX_COMBINED_AUDIO:
             raise ValueError("audio_combination_too_large")
 
-        async def _run():
+        def _run():  # sync helper (for threadpool)
             with tempfile.TemporaryDirectory() as td:
                 in_path = Path(td) / "in.webm"
                 out_path = Path(td) / "out.wav"
@@ -388,6 +393,7 @@ class LightweightAIEngine:
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                     logger.warning(f"Audio conversion failed: {e}")
                     return data, "webm"
+
         return await run_in_threadpool(_run)
 
     async def speech_to_text(self, audio_bytes: bytes) -> str:
@@ -602,7 +608,7 @@ class DatabaseManager:
         import pickle
         async with aiosqlite.connect(self.db_path) as conn:
             conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT * FROM knowledge_base ORDER BY last_updated DESC") as cur:
+            async with conn.execute("SELECT * FROM knowledge_base") as cur:
                 rows = await cur.fetchall()
         items: List[KnowledgeItem] = []
         for r in rows:
@@ -635,11 +641,6 @@ class DatabaseManager:
                 )
             )
         return out
-
-    async def resolve_unknown(self, uq_id: str):
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("UPDATE unknown_questions SET resolved = 1 WHERE id = ?", (uq_id,))
-            await conn.commit()
 
     async def get_call_statistics(self) -> Dict[str, Any]:
         start_iso, end_iso = today_utc_range()
@@ -721,85 +722,101 @@ class KnowledgeBaseManager:
 
 
 # ------------------------------------------------------------------------------
-# Web Scraper (domain-guarded)
+# Simple Web Scraper (urllib + BeautifulSoup)
 # ------------------------------------------------------------------------------
 class WebScraper:
-    def __init__(self, allowed_hosts: set[str], max_pages: int = 40, timeout: float = 10.0):
-        self.allowed_hosts = allowed_hosts
-        self.max_pages = max_pages
-        self.timeout = timeout
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; AI-Voice-Agent/1.0)"
-        }
+    def __init__(self, allowed_hosts: List[str]):
+        self.allowed_hosts = set(h.strip().lower() for h in allowed_hosts if h.strip())
 
     def _allowed(self, url: str) -> bool:
+        if not self.allowed_hosts:
+            return True  # allow all (not recommended)
         try:
-            host = urlparse(url).netloc.lower()
-            return host in self.allowed_hosts
+            netloc = urlparse(url).netloc.lower()
+            return any(netloc == h or netloc.endswith("." + h) for h in self.allowed_hosts)
         except Exception:
             return False
 
-    async def scrape(self, base_url: str) -> List[Dict[str, str]]:
-        if not self._allowed(base_url):
-            raise ValueError("disallowed_host")
+    def _fetch(self, url: str, timeout: float = 10.0) -> Optional[bytes]:
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; AI-Voice-Agent/1.0)"
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200 and "text/html" in resp.headers.get("Content-Type", ""):
+                    return resp.read()
+                return None
+        except Exception as e:
+            logger.warning(f"Fetch failed for {url}: {e}")
+            return None
 
-        seen = set()
-        queue = [base_url]
-        results: List[Dict[str, str]] = []
-
-        async with httpx.AsyncClient(timeout=self.timeout, headers=self.headers, follow_redirects=True) as client:
-            while queue and len(seen) < self.max_pages:
-                url = queue.pop(0)
-                if url in seen:
-                    continue
-                seen.add(url)
-                try:
-                    r = await client.get(url)
-                    if r.status_code != 200 or "text/html" not in (r.headers.get("content-type") or ""):
-                        continue
-                    soup = BeautifulSoup(r.text, "html.parser")
-                    # Extract Q&A-ish chunks
-                    text = self._clean_text(soup)
-                    qa = self._extract_qa_pairs(text, url)
-                    results.extend(qa)
-                    # enqueue links
-                    for a in soup.find_all("a", href=True):
-                        nxt = urljoin(url, a["href"])
-                        if self._allowed(nxt) and nxt not in seen:
-                            queue.append(nxt)
-                except Exception as e:
-                    logger.warning(f"scrape error on {url}: {e}")
-                    continue
-
-        return results
-
-    def _clean_text(self, soup: BeautifulSoup) -> str:
+    def _extract_text(self, html: bytes) -> str:
+        if not BS4_AVAILABLE:
+            # Fallback: naive strip of tags (very rough)
+            try:
+                txt = html.decode("utf-8", errors="ignore")
+                return " ".join(txt.split())
+            except Exception:
+                return ""
+        soup = BeautifulSoup(html, "html.parser")
         for tag in soup(["script", "style", "noscript"]):
             tag.decompose()
-        text = soup.get_text("\n")
+        text = soup.get_text(separator="\n")
         lines = [ln.strip() for ln in text.splitlines()]
-        text = "\n".join([ln for ln in lines if ln])
+        text = "\n".join(ln for ln in lines if ln)
         return text
 
-    def _extract_qa_pairs(self, text: str, src: str) -> List[Dict[str, str]]:
-        out = []
-        lines = text.split("\n")
-        for i, line in enumerate(lines):
-            l = line.strip()
-            if not l:
+    def _extract_qa_pairs(self, text: str, source_url: str) -> List[Dict[str, str]]:
+        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        qa: List[Dict[str, str]] = []
+        for i, ln in enumerate(lines):
+            ln_low = ln.lower()
+            is_q = ln.endswith("?") or ln_low.startswith(("what", "how", "why", "when", "where", "who"))
+            if is_q:
+                ans_parts = []
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    nxt = lines[j]
+                    if nxt.endswith("?"):  # next Q starts
+                        break
+                    ans_parts.append(nxt)
+                if ans_parts:
+                    ans = " ".join(ans_parts)
+                    if 20 <= len(ans) <= 600:
+                        qa.append({"question": ln, "answer": ans, "source": source_url})
+        return qa
+
+    def scrape(self, base_url: str, max_pages: int = 30) -> List[Dict[str, str]]:
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError("url_must_be_http_https")
+        if not self._allowed(base_url):
+            raise PermissionError("scrape_host_not_allowed")
+
+        visited = set()
+        queue: List[str] = [base_url]
+        results: List[Dict[str, str]] = []
+
+        while queue and len(visited) < max_pages:
+            url = queue.pop(0)
+            if url in visited:
                 continue
-            if l.endswith("?") or l.lower().startswith(("what", "how", "why", "when", "where")) or (l.isupper() and len(l) < 80):
-                # take next 1–3 lines as an answer candidate
-                ans_lines = []
-                for j in range(i + 1, min(i + 4, len(lines))):
-                    nxt = lines[j].strip()
-                    if nxt:
-                        ans_lines.append(nxt)
-                if ans_lines:
-                    ans = " ".join(ans_lines)
-                    if 20 <= len(ans) <= 500:
-                        out.append({"question": l, "answer": ans, "source": src})
-        return out
+            visited.add(url)
+
+            html = self._fetch(url)
+            if not html:
+                continue
+
+            text = self._extract_text(html)
+            results.extend(self._extract_qa_pairs(text, url))
+
+            # Discover more links (limited, only same host)
+            if BS4_AVAILABLE:
+                soup = BeautifulSoup(html, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    nxt = urljoin(url, a["href"])
+                    if nxt.startswith(base_url) and nxt not in visited and len(queue) < max_pages:
+                        queue.append(nxt)
+
+        return results
 
 
 # ------------------------------------------------------------------------------
@@ -810,12 +827,12 @@ ai_engine = LightweightAIEngine()
 knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
 scraper = WebScraper(Config.ALLOWED_SCRAPE_HOSTS)
 
-app = FastAPI(title="AI Voice Agent System - Production + UI", version="2.0.0")
+app = FastAPI(title="AI Voice Agent System - Final Production", version="2.0.0")
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=Config.CORS_ORIGINS,
+    allow_origins=Config.CORS_ORIGINS if Config.CORS_ORIGINS else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -831,6 +848,7 @@ async def _startup():
     eff_port = int(os.getenv("PORT", str(Config.PORT)))
     http_url = f"http://localhost:{eff_port}"
     ws_url = f"ws://localhost:{eff_port}/ws/voice"
+    logger.info("Starting AI Voice Agent System (Final Production + Full UI)")
     logger.info(f"Dashboard (effective): {http_url}")
     logger.info(f"WS (effective):        {ws_url}")
     logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
@@ -838,7 +856,7 @@ async def _startup():
 
 
 # ------------------------------------------------------------------------------
-# Inlined UI (tabs: Voice / Knowledge Base / Web Scraper)
+# Inlined Full UI
 # ------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -849,144 +867,120 @@ async def index():
 <title>AI Voice Agent</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  :root{
-    --bg:#0b1020;--panel:#131a33;--card:#19224a;--accent:#5b8cff;--accent2:#10b981;--accent3:#f59e0b;--txt:#dbeafe;--muted:#94a3b8;
-  }
-  *{box-sizing:border-box}
-  body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--txt);margin:0}
-  header{padding:20px 28px;background:linear-gradient(180deg,var(--panel),transparent)}
-  h1{margin:0;font-size:28px}
-  main{max-width:1000px;margin:0 auto;padding:0 16px 60px}
-  .tabs{display:flex;gap:12px;margin:10px 0 20px 0;flex-wrap:wrap}
-  .tab{padding:10px 16px;border-radius:999px;background:#0f1530;border:1px solid #1e2a5a;cursor:pointer}
-  .tab.active{background:var(--accent);color:#fff;border-color:transparent}
-  .grid{display:grid;gap:14px}
-  @media(min-width:900px){.grid{grid-template-columns:1.2fr .8fr}}
-  .card{background:var(--card);border:1px solid #1e2a5a;border-radius:14px;padding:16px}
-  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
-  button{padding:12px 16px;border-radius:12px;border:1px solid #1f2a5a;background:var(--accent);color:#fff;cursor:pointer;font-weight:600}
-  button.secondary{background:var(--accent2);border-color:#0d8f6a}
-  button.warn{background:#ef4444;border-color:#b91c1c}
-  button.ghost{background:#0f1530;color:var(--txt);border-color:#253163}
-  button:disabled{opacity:.55;cursor:not-allowed}
-  input,textarea{width:100%;background:#0f1530;border:1px solid #243063;color:var(--txt);border-radius:10px;padding:10px}
-  label{font-size:13px;color:var(--muted)}
-  .badge{display:inline-block;padding:2px 10px;border-radius:999px;background:#0f1530;border:1px solid #253163}
-  .muted{color:var(--muted)}
-  #log{white-space:pre-wrap;background:#0f1530;color:#cde; padding:12px;border-radius:10px; min-height:140px; max-height:240px; overflow:auto}
-  table{width:100%;border-collapse:collapse}
-  th,td{border-bottom:1px solid #243063;padding:8px 6px;text-align:left;font-size:14px}
-  th{color:#93c5fd}
-  .pill{display:inline-block;background:#0f1530;border:1px solid #243063;color:#cde;padding:2px 8px;border-radius:999px;font-size:12px}
+  :root { --bg:#0b1020; --fg:#e9eef8; --muted:#a7b3cc; --accent:#6aa7ff; --card:#121832; --btn:#1b2447; --ok:#18c29c; --warn:#ffb020; --err:#ff6b6b; }
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial;background:var(--bg);color:var(--fg);max-width:1100px;margin:0 auto;padding:24px}
+  h1{margin:0 0 12px 0}
+  .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 12px}
+  .tab{padding:10px 14px;border:1px solid #2a335f;border-radius:12px;background:var(--btn);cursor:pointer}
+  .tab.active{background:var(--accent);color:#000}
+  .panel{display:none;background:var(--card);border:1px solid #2a335f;border-radius:12px;padding:16px;margin-bottom:16px}
+  .panel.active{display:block}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+  button{padding:10px 14px;border:1px solid #2a335f;border-radius:10px;background:var(--btn);color:var(--fg);cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  input,textarea{background:#0e1530;color:var(--fg);border:1px solid #2a335f;border-radius:10px;padding:10px;width:100%}
+  label{display:block;margin:8px 0 6px 2px;color:var(--muted)}
+  .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+  .col6{grid-column:span 6} .col12{grid-column:span 12}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:#243065;color:#cfe; font-weight:600}
+  #log{white-space:pre-wrap;background:#0e1530;color:#cde; padding:12px;border-radius:10px; min-height:140px;border:1px solid #2a335f}
+  .pill{padding:3px 8px;border-radius:999px;background:#26335f;color:#dfe}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)}
 </style>
-<header><h1>AI Voice Agent</h1></header>
-<main>
-  <div class="tabs">
-    <div class="tab active" data-tab="voice">Voice</div>
-    <div class="tab" data-tab="kb">Knowledge Base</div>
-    <div class="tab" data-tab="scraper">Web Scraper</div>
-    <div class="tab" data-tab="stats">Stats</div>
+
+<h1>AI Voice Agent</h1>
+<div class="tabs">
+  <div class="tab active" data-id="voice">🎙️ Voice</div>
+  <div class="tab" data-id="kb">📚 Knowledge Base</div>
+  <div class="tab" data-id="add">➕ Add Item</div>
+  <div class="tab" data-id="scrape">🕷️ Scrape Website</div>
+  <div class="tab" data-id="stats">📈 Stats</div>
+</div>
+
+<!-- Voice Panel -->
+<div class="panel active" id="panel-voice">
+  <div class="row"><span>Status:</span><span id="status" class="badge">Idle</span></div>
+  <div class="row">
+    <button id="connectBtn">Connect</button>
+    <button id="startBtn" disabled>Start Mic</button>
+    <button id="stopBtn" disabled>Stop Mic</button>
+    <button id="disconnectBtn" disabled>Disconnect</button>
   </div>
+  <div class="row"><audio id="player" controls></audio></div>
+  <h3>Log</h3>
+  <div id="log"></div>
+</div>
 
-  <!-- VOICE -->
-  <section id="voice" class="grid">
-    <div class="card">
-      <div class="row"><span>Status:</span><span id="status" class="badge">Idle</span></div>
-      <div class="row">
-        <button id="connectBtn">Connect</button>
-        <button id="startBtn" class="secondary" disabled>Start Mic</button>
-        <button id="stopBtn" class="ghost" disabled>Stop Mic</button>
-        <button id="disconnectBtn" class="warn" disabled>Disconnect</button>
-      </div>
-      <div class="row"><audio id="player" controls></audio></div>
-      <div class="row">
-        <label>Transcript</label>
-        <textarea id="transcript" rows="7" readonly></textarea>
-      </div>
-      <h3>Log</h3>
-      <div id="log"></div>
-    </div>
-    <div class="card">
-      <h3>Quick Help</h3>
-      <p class="muted">Use a Chromium browser. Allow mic access. You should see chunks ~300ms being sent. If you leave the tab idle for minutes, the PaaS may recycle the instance.</p>
-      <div class="row"><span class="pill">WS: /ws/voice</span><span class="pill">TTS: MP3</span><span class="pill">STT: whisper-1</span></div>
-      <div id="healthbox" class="muted"></div>
-    </div>
-  </section>
+<!-- Knowledge Base Panel -->
+<div class="panel" id="panel-kb">
+  <div class="row">
+    <button id="refreshUnknowns">Refresh Unknown Questions</button>
+  </div>
+  <div id="unknownList"></div>
+</div>
 
-  <!-- KB -->
-  <section id="kb" style="display:none" class="grid">
-    <div class="card">
-      <h3>Add Knowledge Item</h3>
-      <div class="row"><input id="kb_q" placeholder="Question"/></div>
-      <div class="row"><textarea id="kb_a" rows="5" placeholder="Answer"></textarea></div>
-      <div class="row">
-        <button id="kb_add" class="secondary">Add</button>
-      </div>
+<!-- Add Item Panel -->
+<div class="panel" id="panel-add">
+  <div class="grid">
+    <div class="col12">
+      <label>Question</label>
+      <textarea id="addQ" rows="2" placeholder="e.g., What are your delivery options?"></textarea>
     </div>
-    <div class="card">
-      <h3>Knowledge Items</h3>
-      <div class="row"><button id="kb_refresh" class="ghost">Refresh</button></div>
-      <table id="kb_table">
-        <thead><tr><th>Question</th><th>Answer</th><th>Source</th><th>Usage</th></tr></thead>
-        <tbody></tbody>
-      </table>
+    <div class="col12">
+      <label>Answer</label>
+      <textarea id="addA" rows="4" placeholder="Provide a helpful, concise answer."></textarea>
     </div>
-    <div class="card">
-      <h3>Unknown Questions (Unresolved)</h3>
-      <div class="row"><button id="uq_refresh" class="ghost">Refresh</button></div>
-      <table id="uq_table">
-        <thead><tr><th>When</th><th>Question</th><th>Suggested</th><th>Resolve</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-  </section>
+  </div>
+  <div class="row">
+    <button id="addSubmit">Add to Knowledge Base</button>
+    <span id="addMsg" class="pill"></span>
+  </div>
+</div>
 
-  <!-- SCRAPER -->
-  <section id="scraper" style="display:none" class="grid">
-    <div class="card">
-      <h3>Scrape Website (domain-guarded)</h3>
-      <div class="row"><input id="scrape_url" placeholder="https://tablescapes.com/faq"/></div>
-      <div class="row">
-        <button id="scrape_btn" class="secondary">Scrape</button>
-      </div>
-      <div id="scrape_result" class="muted"></div>
+<!-- Scrape Panel -->
+<div class="panel" id="panel-scrape">
+  <div class="grid">
+    <div class="col12">
+      <label>Website URL</label>
+      <input id="scrapeUrl" placeholder="https://www.example.com/faq" />
     </div>
-  </section>
+  </div>
+  <div class="row">
+    <button id="scrapeBtn">Scrape & Ingest</button>
+    <span id="scrapeMsg" class="pill"></span>
+  </div>
+  <div id="scrapePreview"></div>
+</div>
 
-  <!-- STATS -->
-  <section id="stats" style="display:none" class="grid">
-    <div class="card">
-      <h3>Stats Today</h3>
-      <div class="row"><button id="stats_refresh" class="ghost">Refresh</button></div>
-      <div id="stats_box" class="muted"></div>
-    </div>
-  </section>
-</main>
+<!-- Stats Panel -->
+<div class="panel" id="panel-stats">
+  <div class="row">
+    <button id="refreshStats">Refresh Stats</button>
+  </div>
+  <pre id="statsBox" style="background:#0e1530;border-radius:10px;padding:12px;border:1px solid #2a335f"></pre>
+</div>
 
 <script>
 (() => {
-  // Tabs
+  // Tab logic
   const tabs = document.querySelectorAll('.tab');
-  const sections = {voice: document.getElementById('voice'), kb: document.getElementById('kb'),
-                    scraper: document.getElementById('scraper'), stats: document.getElementById('stats')};
+  const panels = document.querySelectorAll('.panel');
   tabs.forEach(t => t.onclick = () => {
     tabs.forEach(x => x.classList.remove('active'));
     t.classList.add('active');
-    Object.values(sections).forEach(s => s.style.display = 'none');
-    sections[t.dataset.tab].style.display = '';
+    const id = t.getAttribute('data-id');
+    panels.forEach(p => p.classList.remove('active'));
+    document.getElementById('panel-' + id).classList.add('active');
   });
 
+  // Voice
   const statusEl = document.getElementById('status');
   const logEl = document.getElementById('log');
   const player = document.getElementById('player');
-  const transcriptEl = document.getElementById('transcript');
   const connectBtn = document.getElementById('connectBtn');
   const startBtn = document.getElementById('startBtn');
   const stopBtn = document.getElementById('stopBtn');
   const disconnectBtn = document.getElementById('disconnectBtn');
-  const healthBox = document.getElementById('healthbox');
-
   let ws = null, stream = null, recorder = null;
 
   function log(msg, obj){
@@ -1000,15 +994,6 @@ async def index():
     return proto + location.host + '/ws/voice';
   }
 
-  async function refreshHealth(){
-    try{
-      const r = await fetch('/health');
-      const j = await r.json();
-      healthBox.textContent = 'Breakers: STT=' + j.circuit_breakers.stt.state + ', CHAT=' + j.circuit_breakers.chat.state;
-    }catch{}
-  }
-  refreshHealth();
-
   connectBtn.onclick = () => {
     if(ws && ws.readyState === WebSocket.OPEN) return;
     ws = new WebSocket(wsUrl());
@@ -1019,7 +1004,7 @@ async def index():
       setStatus('Connected'); log('WS open');
       startBtn.disabled = false;
       stopBtn.disabled = true;
-      disconnectBtn.disabled = false; // explicit
+      disconnectBtn.disabled = false;   // fixed
       connectBtn.disabled = true;
     };
     ws.onclose = ev => {
@@ -1029,7 +1014,6 @@ async def index():
       if(stream) { stream.getTracks().forEach(t=>t.stop()); stream = null; }
     };
     ws.onerror = () => { log('WS error'); };
-
     ws.onmessage = ev => {
       try {
         const msg = JSON.parse(ev.data);
@@ -1038,7 +1022,6 @@ async def index():
         else if(msg.type === 'response'){
           setStatus('Responded');
           log('Agent: ' + msg.text + ' (conf=' + (msg.confidence ?? 0).toFixed(2) + ')');
-          transcriptEl.value += "\\nAgent: " + msg.text;
           if(msg.audio_b64 && msg.audio_mime){
             player.src = 'data:' + msg.audio_mime + ';base64,' + msg.audio_b64;
             player.play().catch(()=>{});
@@ -1054,7 +1037,7 @@ async def index():
   startBtn.onclick = async () => {
     if(!ws || ws.readyState !== WebSocket.OPEN) { log('WS not open'); return; }
     if(!navigator.mediaDevices || !window.MediaRecorder){
-      alert('MediaRecorder not supported. Use Chrome/Edge/Firefox.');
+      alert('MediaRecorder not supported in this browser. Use Chrome/Edge/Firefox.');
       return;
     }
     try {
@@ -1068,8 +1051,7 @@ async def index():
           ws.send(buf); // binary frames
         }
       };
-      recorder.onstart = () => transcriptEl.value += (transcriptEl.value ? "\\n" : "") + "— Recording started —";
-      recorder.start(300); // ~300ms chunks; server batches too
+      recorder.start(300); // ~300ms chunks
       setStatus('Recording'); startBtn.disabled = true; stopBtn.disabled = false; disconnectBtn.disabled = false;
       log('Recorder started with mime=' + (mime||'default'));
     } catch(err){
@@ -1089,167 +1071,90 @@ async def index():
     if(ws){ ws.close(1000, 'client_close'); }
   };
 
-  // --- KB UI ---
-  async function kbRefresh(){
-    const r = await fetch('/api/knowledge/items');
-    const j = await r.json();
-    const tbody = document.querySelector('#kb_table tbody');
-    tbody.innerHTML = '';
-    j.items.forEach(it => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = '<td>'+escapeHtml(it.question)+'</td><td>'+escapeHtml(it.answer)+'</td><td>'+escapeHtml(it.source)+'</td><td>'+it.usage_count+'</td>';
-      tbody.appendChild(tr);
-    });
-  }
-  async function uqRefresh(){
-    const r = await fetch('/api/knowledge/unknown');
-    const j = await r.json();
-    const tbody = document.querySelector('#uq_table tbody');
-    tbody.innerHTML = '';
-    j.questions.forEach(q => {
-      const tr = document.createElement('tr');
-      const when = new Date(q.timestamp).toLocaleString();
-      tr.innerHTML = '<td>'+when+'</td><td>'+escapeHtml(q.question)+'</td><td>'+escapeHtml(q.suggested_answer||"")+
-        '</td><td><button data-id="'+q.id+'" class="secondary">Resolve → KB</button></td>';
-      tbody.appendChild(tr);
-    });
-    tbody.querySelectorAll('button').forEach(btn=>{
-      btn.onclick = () => {
-        const row = btn.closest('tr');
-        document.getElementById('kb_q').value = row.children[1].textContent;
-        document.getElementById('kb_a').value = row.children[2].textContent;
-        // Mark resolved after adding (see handler)
-        btn.setAttribute('data-pending-resolve','1');
-        btn.textContent = 'Will resolve on Add';
-      };
-    });
-  }
-  function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
-
-  document.getElementById('kb_refresh').onclick = kbRefresh;
-  document.getElementById('uq_refresh').onclick = uqRefresh;
-  document.getElementById('kb_add').onclick = async () => {
-    const q = document.getElementById('kb_q').value.trim();
-    const a = document.getElementById('kb_a').value.trim();
-    if(!q || !a) { alert('Provide both question and answer.'); return; }
-    const r = await fetch('/api/knowledge/add', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question:q, answer:a})});
-    const j = await r.json();
-    if(j.status !== 'success'){ alert('Add failed: ' + (j.message||'')); return; }
-    await kbRefresh();
-    // If a pending unknown question was staged, mark it resolved
-    // Find a row with matching question
-    const uqRows = Array.from(document.querySelectorAll('#uq_table tbody tr'));
-    for(const row of uqRows){
-      if(row.children[1].textContent.trim() === q.trim()){
-        const idBtn = row.querySelector('button[data-pending-resolve="1"]');
-        if(idBtn){
-          const uq_id = idBtn.getAttribute('data-id');
-          await fetch('/api/knowledge/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question_id: uq_id})});
-          await uqRefresh();
-        }
-        break;
-      }
+  // KB – Unknowns & Resolve
+  async function refreshUnknowns(){
+    const res = await fetch('/api/knowledge/unknown');
+    const data = await res.json();
+    const cont = document.getElementById('unknownList');
+    if(!data.questions || !data.questions.length){
+      cont.innerHTML = '<p class="muted">No unknown questions.</p>';
+      return;
     }
-    document.getElementById('kb_q').value = '';
-    document.getElementById('kb_a').value = '';
+    cont.innerHTML = '';
+    data.questions.forEach(q => {
+      const card = document.createElement('div');
+      card.style = "border:1px solid #2a335f;padding:12px;border-radius:10px;margin:8px 0;background:#0e1530";
+      card.innerHTML = `
+        <div><b>Question:</b> ${q.question}</div>
+        <div style="color:#a7b3cc"><b>Suggested:</b> ${q.suggested_answer || '(none)'}</div>
+        <div class="row" style="margin-top:8px">
+          <textarea rows="3" style="width:100%" placeholder="Provide final answer...">${q.suggested_answer || ''}</textarea>
+          <button>Resolve</button>
+        </div>
+      `;
+      const textarea = card.querySelector('textarea');
+      const btn = card.querySelector('button');
+      btn.onclick = async () => {
+        const body = { question_id: q.id, question: q.question, answer: textarea.value || '' };
+        const resp = await fetch('/api/knowledge/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+        const out = await resp.json();
+        if(out.status === 'success'){
+          card.style.opacity = .5;
+          btn.disabled = true;
+        } else {
+          alert('Resolve failed: ' + out.message);
+        }
+      };
+      cont.appendChild(card);
+    });
+  }
+  document.getElementById('refreshUnknowns').onclick = refreshUnknowns;
+
+  // Add Item
+  document.getElementById('addSubmit').onclick = async () => {
+    const q = document.getElementById('addQ').value.trim();
+    const a = document.getElementById('addA').value.trim();
+    const msg = document.getElementById('addMsg');
+    if(!q || !a){ msg.textContent = 'Provide both question and answer.'; return; }
+    msg.textContent = 'Saving...';
+    const res = await fetch('/api/knowledge/add', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({question:q, answer:a})});
+    const out = await res.json();
+    msg.textContent = out.message || out.status || 'done';
+    if(out.status === 'success'){ document.getElementById('addQ').value=''; document.getElementById('addA').value=''; }
   };
 
-  // --- Scraper UI ---
-  document.getElementById('scrape_btn').onclick = async () => {
-    const url = (document.getElementById('scrape_url').value||'').trim();
-    if(!url) { alert('Provide URL'); return; }
-    const r = await fetch('/api/knowledge/scrape', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
-    const j = await r.json();
-    document.getElementById('scrape_result').textContent = (j.status==='success') ? ('Added '+ j.added +' Q&A items from '+url) : ('Error: ' + (j.message||''));
-    if(j.status==='success'){ kbRefresh(); }
+  // Scraper
+  document.getElementById('scrapeBtn').onclick = async () => {
+    const url = document.getElementById('scrapeUrl').value.trim();
+    const msg = document.getElementById('scrapeMsg');
+    const prev = document.getElementById('scrapePreview');
+    if(!url){ msg.textContent = 'Enter a URL.'; return; }
+    msg.textContent = 'Scraping...';
+    prev.innerHTML = '';
+    const res = await fetch('/api/knowledge/scrape', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
+    const out = await res.json();
+    if(out.status === 'success'){
+      msg.textContent = `Ingested ${out.ingested} items from ${out.url}`;
+      if(out.samples && out.samples.length){
+        prev.innerHTML = '<h4>Samples</h4>' + out.samples.map(s => '<div style="border:1px solid #2a335f;padding:10px;border-radius:10px;margin:6px 0;background:#0e1530"><b>Q:</b> '+s.question+'<br><b>A:</b> '+s.answer+'</div>').join('');
+      }
+    } else {
+      msg.textContent = 'Error: ' + (out.message || 'unknown');
+    }
   };
 
-  // --- Stats UI ---
-  document.getElementById('stats_refresh').onclick = async () => {
-    const r = await fetch('/api/stats');
-    const j = await r.json();
-    const box = document.getElementById('stats_box');
-    box.innerHTML = '<div>Total calls: <b>'+j.total_calls+'</b></div>'+
-                    '<div>Answered: <b>'+j.answered_calls+'</b></div>'+
-                    '<div>Transferred: <b>'+j.transferred_calls+'</b></div>'+
-                    '<div>Avg confidence: <b>'+Number(j.avg_confidence||0).toFixed(2)+'</b></div>'+
-                    '<div>Unknown (unresolved): <b>'+j.unknown_questions+'</b></div>';
-  };
+  // Stats
+  async function refreshStats(){
+    const res = await fetch('/api/stats');
+    const out = await res.json();
+    document.getElementById('statsBox').textContent = JSON.stringify(out, null, 2);
+  }
+  document.getElementById('refreshStats').onclick = refreshStats;
 
 })();
 </script>
 </html>
     """
-
-
-# ------------------------------------------------------------------------------
-# API: KB + Scraper + Stats
-# ------------------------------------------------------------------------------
-@app.get("/api/knowledge/items")
-async def api_kb_items():
-    items = await db_manager.get_knowledge_base()
-    # do not return embeddings
-    return {"items": [
-        {"id": it.id, "question": it.question, "answer": it.answer, "source": it.source,
-         "last_updated": it.last_updated.isoformat() if it.last_updated else None, "usage_count": it.usage_count}
-        for it in items
-    ]}
-
-@app.post("/api/knowledge/add")
-async def api_kb_add(payload: Dict[str, Any]):
-    q = (payload.get("question") or "").strip()
-    a = (payload.get("answer") or "").strip()
-    if not q or not a:
-        return JSONResponse({"status": "error", "message": "Missing question/answer"}, status_code=400)
-    await knowledge_manager.add_knowledge_item(q, a, "manual")
-    return {"status": "success"}
-
-@app.get("/api/knowledge/unknown")
-async def api_kb_unknown():
-    qs = await db_manager.get_unknown_questions(resolved=False)
-    return {"questions": [
-        {"id": q.id, "question": q.question, "call_id": q.call_id, "timestamp": q.timestamp.isoformat(),
-         "resolved": q.resolved, "suggested_answer": q.suggested_answer}
-        for q in qs
-    ]}
-
-@app.post("/api/knowledge/resolve")
-async def api_kb_resolve(payload: Dict[str, Any]):
-    qid = (payload.get("question_id") or "").strip()
-    if not qid:
-        return JSONResponse({"status": "error", "message": "Missing question_id"}, status_code=400)
-    await db_manager.resolve_unknown(qid)
-    return {"status": "success"}
-
-@app.post("/api/knowledge/scrape")
-async def api_kb_scrape(payload: Dict[str, Any]):
-    url = (payload.get("url") or "").strip()
-    if not url:
-        return JSONResponse({"status": "error", "message": "Missing url"}, status_code=400)
-    try:
-        qa = await scraper.scrape(url)
-        added = 0
-        for pair in qa:
-            await knowledge_manager.add_knowledge_item(pair["question"], pair["answer"], f"scraped:{pair['source']}")
-            added += 1
-        return {"status": "success", "added": added}
-    except ValueError as ve:
-        return JSONResponse({"status": "error", "message": str(ve)}, status_code=400)
-    except Exception as e:
-        logger.error(f"scrape failure: {e}")
-        return JSONResponse({"status": "error", "message": "scrape_failed"}, status_code=500)
-
-@app.get("/api/stats")
-async def api_stats():
-    return await db_manager.get_call_statistics()
-
-
-# ------------------------------------------------------------------------------
-# HEAD / for platform checks (avoid 405 on HEAD)
-# ------------------------------------------------------------------------------
-@app.head("/")
-async def head_root():
-    return Response(status_code=200)
 
 
 # ------------------------------------------------------------------------------
@@ -1333,8 +1238,10 @@ async def voice_websocket(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "audio_combination_too_large"})
                 continue
 
+            logger.info(f"STT batch bytes={len(batch)}")
             # STT
             text = await ai_engine.speech_to_text(batch)
+            logger.info(f"STT text='{text[:120]}'")
             if not text:
                 await websocket.send_json({"type": "listening"})
                 continue
@@ -1359,8 +1266,6 @@ async def voice_websocket(websocket: WebSocket):
 
                 # LLM response
                 response_text = await ai_engine.generate_response(text)
-                # Count LLM replies as answered for stats
-                call.outcome = call.outcome or "answered"
 
                 # Record unknown for later curation
                 uq = UnknownQuestion(
@@ -1376,6 +1281,7 @@ async def voice_websocket(websocket: WebSocket):
             call.confidence_score = confidence
 
             # TTS
+            logger.info(f"TTS len(text)={len(response_text)}")
             audio_bytes = await ai_engine.text_to_speech(response_text)
 
             await websocket.send_json({
@@ -1406,6 +1312,85 @@ async def voice_websocket(websocket: WebSocket):
 
 
 # ------------------------------------------------------------------------------
+# Knowledge & Scraper Endpoints
+# ------------------------------------------------------------------------------
+@app.post("/api/knowledge/add")
+async def add_knowledge(req: Request):
+    data = await req.json()
+    q = (data.get("question") or "").strip()
+    a = (data.get("answer") or "").strip()
+    if not q or not a:
+        return JSONResponse({"status": "error", "message": "question_and_answer_required"}, status_code=400)
+    await knowledge_manager.add_knowledge_item(q, a, source="manual")
+    return {"status": "success", "message": "Knowledge item added"}
+
+@app.get("/api/knowledge/unknown")
+async def get_unknown():
+    qs = await db_manager.get_unknown_questions(resolved=False)
+    return {"questions": [q.__dict__ for q in qs]}
+
+@app.post("/api/knowledge/resolve")
+async def resolve_unknown(req: Request):
+    data = await req.json()
+    qid = data.get("question_id")
+    q = (data.get("question") or "").strip()
+    a = (data.get("answer") or "").strip()
+    if not all([qid, q, a]):
+        return JSONResponse({"status": "error", "message": "question_id_question_answer_required"}, status_code=400)
+    await knowledge_manager.add_knowledge_item(q, a, source="resolved")
+    # mark resolved
+    async with aiosqlite.connect(Config.DATABASE_PATH) as conn:
+        await conn.execute("UPDATE unknown_questions SET resolved=1 WHERE id=?", (qid,))
+        await conn.commit()
+    return {"status": "success", "message": "Question resolved and added to KB"}
+
+@app.post("/api/knowledge/scrape")
+async def scrape_site(req: Request):
+    if not BS4_AVAILABLE:
+        return JSONResponse({"status": "error", "message": "beautifulsoup4_not_installed"}, status_code=500)
+    data = await req.json()
+    url = (data.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"status": "error", "message": "url_required"}, status_code=400)
+
+    def _scrape():
+        try:
+            pairs = scraper.scrape(url, max_pages=30)
+            return pairs
+        except PermissionError:
+            return "not_allowed"
+        except ValueError:
+            return "bad_url"
+        except Exception as e:
+            logger.error(f"Scrape error: {e}")
+            return "error"
+
+    pairs = await run_in_threadpool(_scrape)
+    if pairs == "not_allowed":
+        return JSONResponse({"status": "error", "message": "scrape_host_not_allowed"}, status_code=403)
+    if pairs == "bad_url":
+        return JSONResponse({"status": "error", "message": "url_must_be_http_https"}, status_code=400)
+    if pairs == "error":
+        return JSONResponse({"status": "error", "message": "scrape_failed"}, status_code=500)
+
+    ingested = 0
+    for p in pairs:
+        try:
+            await knowledge_manager.add_knowledge_item(p["question"], p["answer"], source=f"scraped:{url}")
+            ingested += 1
+        except Exception as e:
+            logger.warning(f"Ingest pair failed: {e}")
+
+    samples = pairs[:3] if isinstance(pairs, list) else []
+    return {"status": "success", "url": url, "ingested": ingested, "samples": samples}
+
+@app.get("/api/stats")
+async def stats():
+    s = await db_manager.get_call_statistics()
+    return s
+
+
+# ------------------------------------------------------------------------------
 # Minimal health endpoint
 # ------------------------------------------------------------------------------
 @app.get("/health")
@@ -1425,9 +1410,5 @@ async def health():
 # Entrypoint
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting AI Voice Agent System (Production + UI)")
     eff_port = int(os.getenv("PORT", str(Config.PORT)))
-    logger.info(f"Dashboard (effective): http://localhost:{eff_port}")
-    logger.info(f"WS (effective):        ws://localhost:{eff_port}/ws/voice")
-    logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
     uvicorn.run(app, host=Config.HOST, port=eff_port, log_level="info")
