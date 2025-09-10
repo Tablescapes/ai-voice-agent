@@ -33,7 +33,8 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 
 import aiosqlite
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
@@ -782,20 +783,51 @@ async def lifespan(app: FastAPI):
     await knowledge_manager.load()
     if not ffmpeg_available():
         logger.warning("ffmpeg not found; STT will attempt WEBM directly; results may be worse.")
+
     eff_port = int(os.getenv("PORT", str(Config.PORT)))
+    external = os.getenv("RENDER_EXTERNAL_URL")  # e.g., https://ai-voice-agent-uz9g.onrender.com
+
+    if external:
+        base_url = external.rstrip("/")
+        ws_url = base_url.replace("https://", "wss://") + "/ws/voice"
+    else:
+        base_url = f"http://localhost:{eff_port}"
+        ws_url   = f"ws://localhost:{eff_port}/ws/voice"
+
+    # Optional: override Config.BASE_URL at runtime if you want downstream code to see it:
+    try:
+        Config.BASE_URL = base_url
+    except Exception:
+        pass
+
     logger.info("Starting AI Voice Agent System (Final Production + Full UI)")
-    logger.info(f"Dashboard (effective): http://localhost:{eff_port}")
-    logger.info(f"WS (effective):        ws://localhost:{eff_port}/ws/voice")
+    logger.info(f"Dashboard (effective): {base_url}")
+    logger.info(f"WS (effective):        {ws_url}")
     logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
     logger.info("Startup complete.")
+
     yield
     # no special shutdown
+
 
 app = FastAPI(
     title="AI Voice Agent System - Final Production",
     version="1.7.0",
     lifespan=lifespan
 )
+
+
+
+@app.head("/", include_in_schema=False)
+def root_head():
+    return Response(status_code=200)
+  
+# Move JSON health to /healthz
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"status": "ok"}
+
+
 
 # CORS
 app.add_middleware(
@@ -1182,8 +1214,6 @@ async def api_stats():
 # ------------------------------------------------------------------------------
 # WebSocket voice endpoint – accepts binary frames and JSON text
 # ------------------------------------------------------------------------------
-from typing import Optional, List, Dict, Any, Tuple
-import json
 
 @app.websocket("/ws/voice")
 async def voice_websocket(websocket: WebSocket):
