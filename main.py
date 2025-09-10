@@ -788,7 +788,7 @@ class KnowledgeBaseManager:
 # ------------------------------------------------------------------------------
 # Scraper (guarded, async) with Q&A + fallback summaries
 # ------------------------------------------------------------------------------
-class WebScraper:
+class class WebScraper:
     def __init__(self, allowed_hosts: set[str], max_pages: int = 40, timeout: int = 10):
         self.allowed_hosts = allowed_hosts
         self.max_pages = max_pages
@@ -823,7 +823,7 @@ class WebScraper:
                         continue
                     soup = BeautifulSoup(r.text, "html.parser")
 
-                    page_title = (soup.title.string.strip() if soup.title and soup.title.string else "").strip()
+                    page_title = (soup.title.string.strip() if soup.title and soup.title.string else "")
                     text = self._clean_text(soup.get_text(" "))
 
                     # Q&A first
@@ -853,20 +853,19 @@ class WebScraper:
         lines = [ln.strip() for ln in t.splitlines()]
         return " ".join([ln for ln in lines if ln])
 
-def _extract_qa(self, text: str, source: str) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    # split on sentence boundaries
-    sentences = re.split(r'(?<=[\.\!\?])\s+', text)
-    for i, s in enumerate(sentences):
-        s = s.strip()
-        if s.endswith("?") and i + 1 < len(sentences):
-            q = s
-            a = sentences[i + 1].strip()
-            # keep only reasonable lengths
-            if 8 < len(q) < 200 and 15 < len(a) < 500:
-                out.append({"question": q, "answer": a, "source": source})
-    return out
-
+    def _extract_qa(self, text: str, source: str) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        # split on sentence boundaries
+        sentences = re.split(r'(?<=[\.\!\?])\s+', text)
+        for i, s in enumerate(sentences):
+            s = s.strip()
+            if s.endswith("?") and i + 1 < len(sentences):
+                q = s
+                a = sentences[i + 1].strip()
+                # keep only reasonable lengths
+                if 8 < len(q) < 200 and 15 < len(a) < 500:
+                    out.append({"question": q, "answer": a, "source": source})
+        return out
 
     def _summary_from_text(self, text: str, max_len: int = 600) -> str:
         """Grab the first meaningful chunk of text as a summary."""
