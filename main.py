@@ -25,6 +25,8 @@ import time
 import threading
 import json
 import uvicorn
+import csv, io
+
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -1222,6 +1224,37 @@ async def admin():
 </div>
 
 <div class="card">
+  <h3>Bulk Add KB (CSV)</h3>
+  <p class="muted">Columns: <b>question, answer [, source]</b>. Header row optional.</p>
+  <textarea id="csvBulk" rows="8" placeholder="question,answer,source
+What is your location?,We are at 123 Main St, Dallas.,kb
+What's your name?,Tablescapes Assistant.,kb"></textarea>
+  <div style="margin-top:8px">
+    <button onclick="bulkCSV()">Upload CSV</button>
+  </div>
+  <pre id="bulkOut" class="muted"></pre>
+</div>
+<script>
+async function bulkCSV(){
+  const csv = document.getElementById('csvBulk').value;
+  const out = document.getElementById('bulkOut');
+  out.textContent = 'Uploading...';
+  try {
+    const r = await fetch('/api/knowledge/bulk_csv', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({csv})
+    });
+    const j = await r.json();
+    out.textContent = JSON.stringify(j, null, 2);
+    loadStats();
+  } catch(e){
+    out.textContent = 'Error: ' + String(e);
+  }
+}
+</script>
+
+<div class="card">
   <h3>Scrape Website (allowed hosts only)</h3>
   <div class="row"><input id="url" placeholder="https://www.example.com"> <button onclick="scrape()">Scrape</button></div>
   <div id="scrapeResult" class="muted"></div>
@@ -1368,6 +1401,75 @@ async def api_add_kb(payload: Dict[str, Any]):
         return JSONResponse({"status":"error","message":"question and answer required"}, status_code=400)
     await knowledge_manager.add_knowledge_item(q, a, source="manual")
     return {"status":"success","message":"Knowledge item added"}
+@app.post("/api/knowledge/bulk_csv")
+async def api_bulk_csv(payload: Dict[str, Any]):
+    """
+    Accepts JSON: {"csv": "<csv text>"}.
+    CSV columns (headered or headerless):
+      - question, answer [, source]
+    Example:
+      question,answer,source
+      "What is your location?","We are at 123 Main St, Dallas.","kb"
+      "What's your name?","We're Tablescapes Assistant.","kb"
+    """
+    raw = (payload.get("csv") or "").strip()
+    if not raw:
+        return JSONResponse({"status": "error", "message": "csv required"}, status_code=400)
+
+    f = io.StringIO(raw)
+    reader = csv.reader(f)
+
+    # Try to detect header
+    first = next(reader, None)
+    if first is None:
+        return JSONResponse({"status": "error", "message": "empty csv"}, status_code=400)
+
+    rows = []
+    # Headered?
+    headered = any(h.lower() in ("question", "answer", "source") for h in first)
+    if headered:
+        headers = [h.strip().lower() for h in first]
+        q_idx = headers.index("question") if "question" in headers else -1
+        a_idx = headers.index("answer")   if "answer"   in headers else -1
+        s_idx = headers.index("source")   if "source"   in headers else -1
+        if q_idx < 0 or a_idx < 0:
+            return JSONResponse({"status":"error","message":"header must include question and answer"}, status_code=400)
+        for row in reader:
+            if not row: continue
+            try:
+                q = (row[q_idx] or "").strip()
+                a = (row[a_idx] or "").strip()
+                s = (row[s_idx] or "bulk").strip() if s_idx >= 0 and s_idx < len(row) else "bulk"
+                if q and a:
+                    rows.append((q, a, s))
+            except Exception:
+                continue
+    else:
+        # Headerless: expect 2–3 columns per row
+        if first and len(first) >= 2:
+            rows.append((first[0].strip(), first[1].strip(), (first[2].strip() if len(first) > 2 else "bulk")))
+        for row in reader:
+            if not row: continue
+            if len(row) < 2: continue
+            rows.append((row[0].strip(), row[1].strip(), (row[2].strip() if len(row) > 2 else "bulk")))
+
+    if not rows:
+        return {"status":"success","message":"No valid rows found.","added":0}
+
+    added, skipped = 0, 0
+    # Reasonable safety cap
+    LIMIT = 2000
+    for (q, a, s) in rows[:LIMIT]:
+        try:
+            await knowledge_manager.add_knowledge_item(q, a, source=s or "bulk")
+            added += 1
+        except Exception:
+            skipped += 1
+
+    return {"status":"success","added":added,"skipped":skipped,"total_received":len(rows[:LIMIT])}
+
+
+
 
 @app.get("/debug/openai", include_in_schema=False)
 async def debug_openai():
