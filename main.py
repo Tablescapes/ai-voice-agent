@@ -104,8 +104,9 @@ class Config:
     ALLOWED_SCRAPE_HOSTS = {h.strip().lower() for h in os.getenv(
         "ALLOWED_SCRAPE_HOSTS", "tablescapes.com,www.tablescapes.com"
     ).split(",") if h.strip()}
-    SCRAPE_MAX_PAGES = int(os.getenv("SCRAPE_MAX_PAGES", "40"))
-    SCRAPE_TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "10"))
+    SCRAPE_MAX_PAGES = int(os.getenv("SCRAPE_MAX_PAGES", "300"))
+    SCRAPE_TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "12"))
+    SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "6"))
 
     # Misc
     MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "4000"))
@@ -752,72 +753,236 @@ class KnowledgeBaseManager:
 # Scraper (guarded)
 # ------------------------------------------------------------------------------
 class WebScraper:
-    def __init__(self, allowed_hosts: set[str], max_pages: int = 40, timeout: int = 10):
+    def __init__(self, allowed_hosts: set[str], max_pages: int = 40, timeout: int = 10, concurrency: int = 4):
         self.allowed_hosts = allowed_hosts
         self.max_pages = max_pages
         self.timeout = timeout
-    def _allowed(self, url: str) -> bool:
+        self.concurrency = concurrency
+
+        # very conservative denylists to avoid trash pages
+        self.deny_substrings = [
+            "/cart", "/checkout", "/my-account", "/account", "/login", "/wp-admin",
+            "/wp-json", "/feed", "/tag/", "/?add-to-cart=", "/?action=", "/?replytocom=",
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf", ".zip", ".mp4", ".mov",
+        ]
+
+        # allow cues for Woo/WordPress catalogs
+        self.allow_cues = [
+            "/product/", "/products/", "/shop/", "/product-category/", "/collections/",
+            "/category/", "/?s=", "post_type=product",
+        ]
+
+        # Search seed terms that expand breadth when deep=True
+        self.seed_terms = [
+            "blue","gold","silver","white","black","ivory","green","pink","red","navy","champagne",
+            "charger","linens","napkin","tablecloth","runner","chiavari","bar","backbar",
+            "flatware","glass","goblet","stemware","china","chair","stool","sofa","lounge",
+            "farm table","round table","banquet","dance floor","heater","umbrella","arch","backdrop"
+        ]
+
+    # ---------- URL helpers ----------
+    def _allowed_host(self, url: str) -> bool:
         try:
             host = urlparse(url).netloc.split(":")[0].lower()
             return any(host == h or host.endswith(f".{h}") for h in self.allowed_hosts)
         except Exception:
             return False
+
+    def _canonical(self, url: str) -> str:
+        # strip fragments & tracking params; normalize
+        pr = urlparse(url)
+        if not pr.scheme or not pr.netloc:
+            return ""
+        qs = []
+        for k, v in [p.split("=", 1) if "=" in p else (p, "") for p in pr.query.split("&") if p]:
+            k_low = k.lower()
+            if k_low in ("utm_source","utm_medium","utm_campaign","utm_term","utm_content","gclid","fbclid","mc_cid","mc_eid"):
+                continue
+            qs.append(f"{k}={v}" if v else k)
+        query = "&".join(qs)
+        canon = pr._replace(fragment="", query=query).geturl()
+        return canon
+
+    def _should_visit(self, url: str) -> bool:
+        if not self._allowed_host(url):
+            return False
+        low = url.lower()
+        if any(s in low for s in self.deny_substrings):
+            return False
+        # Prefer catalog/product-ish pages
+        if any(c in low for c in self.allow_cues):
+            return True
+        # Also allow home, shop roots, category roots
+        return low.rstrip("/").count("/") <= 3
+
+    def _discover_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
+        links = set()
+
+        # rel="next" pagination (common in Woo/WordPress)
+        for link in soup.find_all("link", rel=lambda x: x and "next" in x):
+            href = link.get("href")
+            if href:
+                links.add(urljoin(base_url, href))
+
+        # anchor tags
+        for a in soup.find_all("a", href=True):
+            href = urljoin(base_url, a["href"])
+            links.add(href)
+
+        # simple pattern-based paginations we care about
+        extras = set()
+        for href in list(links):
+            if re.search(r"/page/\d+/?$", href):  # /page/2/
+                nxt = re.sub(r"/page/(\d+)/?", lambda m: f"/page/{int(m.group(1))+1}/", href)
+                extras.add(nxt)
+            if "product-page=" in href:
+                try:
+                    m = re.search(r"product-page=(\d+)", href)
+                    if m:
+                        nxt = re.sub(r"product-page=\d+", f"product-page={int(m.group(1))+1}", href)
+                        extras.add(nxt)
+                except Exception:
+                    pass
+            if "paged=" in href:
+                try:
+                    m = re.search(r"paged=(\d+)", href)
+                    if m:
+                        nxt = re.sub(r"paged=\d+", f"paged={int(m.group(1))+1}", href)
+                        extras.add(nxt)
+                except Exception:
+                    pass
+        links |= extras
+        return list(links)
+
     def _clean_text(self, t: str) -> str:
         lines = [ln.strip() for ln in t.splitlines()]
         return " ".join([ln for ln in lines if ln])
-    def _extract_qa(self, text: str, source: str) -> List[Dict[str, str]]:
-        out: List[Dict[str, str]] = []
+
+    def _extract_qa(self, text: str, source: str) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
         sentences = re.split(r'(?<=[\.\!\?])\s+', text)
         for i, s in enumerate(sentences):
             s = s.strip()
             if s.endswith("?") and i + 1 < len(sentences):
                 q = s; a = sentences[i + 1].strip()
-                if 8 < len(q) < 200 and 15 < len(a) < 500:
+                if 8 < len(q) < 200 and 15 < len(a) < 600:
                     out.append({"question": q, "answer": a, "source": source})
         return out
-    def _summary_from_text(self, text: str, max_len: int = 600) -> str:
+
+    def _summary_from_text(self, text: str, max_len: int = 700) -> str:
         if not text: return ""
-        sentences = [s.strip() for s in text.split(". ") if s.strip()]
+        sentences = [s.strip() for s in re.split(r'(?<=[\.\!\?])\s+', text) if s.strip()]
         buf, total = [], 0
         for s in sentences:
             if len(s) < 5: continue
-            if total + len(s) + 2 > max_len: break
-            buf.append(s); total += len(s) + 2
+            if total + len(s) + 1 > max_len: break
+            buf.append(s); total += len(s) + 1
             if total > max_len * 0.6: break
-        out = ". ".join(buf).strip()
+        out = " ".join(buf).strip()
         return out[:max_len] if out else text[:max_len]
-    async def scrape(self, base_url: str) -> List[Dict[str, str]]:
-        if not self._allowed(base_url):
+
+    async def _fetch(self, client: httpx.AsyncClient, url: str) -> tuple[str, Optional[BeautifulSoup]]:
+        try:
+            r = await client.get(url, headers={"User-Agent": "TablescapesBot/1.0 (+crawl=limited)"})
+            if r.status_code != 200: return url, None
+            ctype = r.headers.get("content-type","")
+            if "text/html" not in ctype: return url, None
+            return url, BeautifulSoup(r.text, "html.parser")
+        except Exception:
+            return url, None
+
+    async def _sitemap_seed(self, client: httpx.AsyncClient, base_root: str) -> list[str]:
+        seeds = []
+        for path in ("/sitemap_index.xml", "/sitemap.xml"):
+            try:
+                r = await client.get(urljoin(base_root, path))
+                if r.status_code != 200 or "xml" not in r.headers.get("content-type",""): continue
+                xml = r.text
+                locs = re.findall(r"<loc>(.*?)</loc>", xml, flags=re.I)
+                for loc in locs:
+                    if self._allowed_host(loc):
+                        seeds.append(loc.strip())
+            except Exception:
+                pass
+        return seeds[: self.max_pages // 2]  # keep balanced
+
+    def _deep_search_seeds(self, base_root: str) -> list[str]:
+        # build /shop/ etc plus color/keyword searches (Woo pattern)
+        out = []
+        for term in self.seed_terms:
+            out.append(f"{base_root.rstrip('/')}/?s={quote_plus(term)}&post_type=product")
+        # common catalog roots
+        out += [
+            f"{base_root.rstrip('/')}/shop/",
+            f"{base_root.rstrip('/')}/products/",
+            f"{base_root.rstrip('/')}/product-category/",
+            f"{base_root.rstrip('/')}/collections/",
+        ]
+        return out
+
+    async def scrape(self, base_url: str, *, deep: bool = False, max_pages: Optional[int] = None) -> list[dict[str,str]]:
+        if not self._allowed_host(base_url):
             raise ValueError("Host not allowed by ALLOWED_SCRAPE_HOSTS")
-        results: List[Dict[str, str]] = []
-        seen, queue = set(), [base_url]
+
+        limit = max_pages or self.max_pages
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
+        queue: list[str] = []
+
+        # initial seeds
+        base_root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+        queue.append(self._canonical(base_url))
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            while queue and len(seen) < self.max_pages:
-                url = queue.pop(0)
-                if url in seen: continue
-                seen.add(url)
-                try:
-                    r = await client.get(url)
-                    if r.status_code != 200 or "text/html" not in r.headers.get("content-type",""):
-                        continue
-                    soup = BeautifulSoup(r.text, "html.parser")
-                    page_title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+            # add sitemap seeds
+            if deep:
+                sm = await self._sitemap_seed(client, base_root)
+                for u in sm:
+                    cu = self._canonical(u)
+                    if cu and self._should_visit(cu):
+                        queue.append(cu)
+                # add deep search seeds
+                for u in self._deep_search_seeds(base_root):
+                    cu = self._canonical(u)
+                    if cu and self._should_visit(cu):
+                        queue.append(cu)
+
+            sem = asyncio.Semaphore(self.concurrency)
+
+            async def crawl_one(u: str):
+                async with sem:
+                    can = self._canonical(u)
+                    if not can or can in seen or not self._should_visit(can): return [], []
+                    seen.add(can)
+                    url, soup = await self._fetch(client, can)
+                    if not soup: return [], []
                     text = self._clean_text(soup.get_text(" "))
                     qa = self._extract_qa(text, url)
-                    if qa:
-                        results += qa
-                    else:
-                        summary = self._summary_from_text(text, 600)
+                    if not qa:
+                        title = (soup.title.string.strip() if soup.title and soup.title.string else "Page")
+                        summary = self._summary_from_text(text, 700)
                         if summary:
-                            q = f"{page_title or 'Page'} – summary"
-                            results.append({"question": q[:200], "answer": summary, "source": url})
-                    for a in soup.find_all("a", href=True):
-                        next_url = urljoin(url, a["href"])
-                        if self._allowed(next_url) and next_url not in seen:
-                            queue.append(next_url)
-                except Exception as e:
-                    logger.warning(f"Scrape error at {url}: {e}")
-        logger.info(f"Scrape finished: {base_url} -> items={len(results)}, pages_scanned={len(seen)}")
+                            qa = [{"question": f"{title} – summary"[:200], "answer": summary, "source": url}]
+                    nexts = []
+                    for v in self._discover_links(soup, url):
+                        cv = self._canonical(v)
+                        if cv and cv not in seen and self._should_visit(cv):
+                            nexts.append(cv)
+                    return qa, nexts
+
+            idx = 0
+            while queue and len(seen) < limit:
+                batch = []
+                while queue and len(batch) < self.concurrency and len(seen) + len(batch) < limit:
+                    batch.append(queue.pop(0))
+                tasks = [asyncio.create_task(crawl_one(u)) for u in batch]
+                for t in asyncio.as_completed(tasks):
+                    qa, nexts = await t
+                    results.extend(qa)
+                    for n in nexts:
+                        if len(seen) + len(queue) >= limit: break
+                        queue.append(n)
+
+        logger.info(f"Scrape finished: pages_scanned={len(seen)} items={len(results)} deep={deep}")
         return results
 
 # ------------------------------------------------------------------------------
@@ -1179,7 +1344,10 @@ async def admin():
   <button onclick="scrape()">Scrape</button>
   <div id="scrapeResult" class="muted"></div>
 </div>
-
+<div class="row" style="margin-top:8px">
+  <label><input id="scrapeDeep" type="checkbox"> Deep crawl</label>
+  <input id="scrapeMax" type="number" min="1" max="1000" placeholder="max pages (e.g. 300)" style="margin-left:12px">
+</div>
 <div class="card">
   <h3>Unknown Questions</h3>
   <div id="unknowns"></div>
@@ -1212,14 +1380,23 @@ async function bulkCSV(){
   }catch(e){ out.textContent = 'Error: ' + String(e); }
 }
 async function scrape(){
-  const url = document.getElementById('scrapeUrl').value.trim(); const out = document.getElementById('scrapeResult');
+  const url = document.getElementById('scrapeUrl').value.trim();
+  const deep = document.getElementById('scrapeDeep').checked;
+  const max_pages = parseInt(document.getElementById('scrapeMax').value || '0', 10) || null;
+  const out = document.getElementById('scrapeResult');
   out.textContent = 'Starting…';
   try{
-    const r = await fetch('/api/knowledge/scrape', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
-    const t = await r.text(); out.textContent = (r.ok ? 'OK: ' : 'ERR: ') + t;
+    const r = await fetch('/api/knowledge/scrape', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url, deep, max_pages})
+    });
+    const t = await r.text();
+    out.textContent = (r.ok ? 'OK: ' : 'ERR: ') + t;
   }catch(e){ out.textContent = 'Network error: ' + String(e); }
   loadStats();
 }
+
 async function resolveUnknown(id){
   const ans = prompt('Provide the answer for this question:'); if(!ans) return;
   const r = await fetch('/api/knowledge/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({question_id:id, answer:ans})});
@@ -1381,20 +1558,30 @@ async def debug_openai():
 @app.post("/api/knowledge/scrape")
 async def api_scrape(payload: Dict[str, Any]):
     url = (payload.get("url") or "").strip()
+    deep = bool(payload.get("deep") or False)
+    max_pages = payload.get("max_pages")
+    try:
+        max_pages = int(max_pages) if max_pages else None
+    except Exception:
+        max_pages = None
+
     if not url:
         return JSONResponse({"status":"error","message":"url required"}, status_code=400)
+
     try:
-        qa = await scraper.scrape(url)
+        qa = await scraper.scrape(url, deep=deep, max_pages=max_pages)
         added = 0
         for item in qa:
             await knowledge_manager.add_knowledge_item(
-                item["question"], item["answer"], source=f"scraped:{item.get('source','')}", url=item.get("source")
+                item["question"],
+                item["answer"],
+                source=f"scraped:{item.get('source','')}",
+                url=item.get("source")
             )
             added += 1
         pages = len({x.get("source") for x in qa}) or 0
-        if added == 0:
-            return {"status":"success","message":"Scrape completed, but no Q&A patterns were found","pages_scanned": pages}
-        return {"status":"success","message":f"Scraped {len(qa)} items; added {added}","pages_scanned": pages}
+        return {"status":"success","message":f"Scraped {len(qa)} items; added {added}",
+                "pages_scanned": pages, "deep": deep, "max_pages_effective": max_pages or Config.SCRAPE_MAX_PAGES}
     except ValueError as ve:
         return JSONResponse({"status":"error","message":str(ve)}, status_code=400)
     except Exception:
