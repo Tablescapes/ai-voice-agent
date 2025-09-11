@@ -53,7 +53,7 @@ class Config:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
     OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-
+    OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
     # Public site for search links
     WEBSITE_BASE_URL = os.getenv("WEBSITE_BASE_URL", "https://www.tablescapes.com")
 
@@ -81,7 +81,7 @@ class Config:
 
     # KB / matching
     SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.25"))
-    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.60"))
+    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.50"))
 
     # Call control
     MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "600"))     # seconds
@@ -139,27 +139,53 @@ def catalog_search_url(q: str) -> str:
         return ""
     return f"{base}/?s={quote_plus(q)}&post_type=product"
 
+
 # Aliases to normalize jargon → improve KB matching
 ALIASES = {
+    # common synonyms → canonicals
     "silverware": "flatware",
     "cutlery": "flatware",
-    "charger": "charger plate",
-    "chargers": "charger plates",
-    "goblet": "glass",
+    "goblet": "glasses",
     "goblets": "glasses",
     "stemware": "glasses",
     "linen": "linens",
-    "napkins": "linens",
     "napkin": "linens",
+    "napkins": "linens",
     "tablecloth": "linens",
     "runner": "linens",
     "sofa": "lounge",
     "couch": "lounge",
-    "barstool": "stool",
     "back bar": "backbar",
     "back-bar": "backbar",
     "dancefloor": "dance floor",
+
+    # chargers & canon plurality
+    "charger": "charger plates",
+    "chargers": "charger plates",
+
+    # barstools canon (do NOT collapse to stools)
+    "bar stool": "barstools",
+    "bar stools": "barstools",
+    "barstool": "barstools",
+
+    # keep generic stools
+    "stool": "stools",
+
+    # single → plural where helpful
+    "chair": "chairs",
+    "stanchion": "stanchions",
+    "rope": "ropes",
+    "candelabra": "candelabras",
+
+    # user phrasings
+    "stanchions and ropes": "stanchions ropes",
+    "stanchions & ropes": "stanchions ropes",
+    "rope stanchions": "stanchions ropes",
+    "lounge furniture": "lounge",
+    "seating": "chairs",
 }
+
+
 
 # Reverse map to recover common variants for a canonical term (for matching bonus)
 REV_ALIASES: Dict[str, List[str]] = {}
@@ -173,15 +199,26 @@ CONTRACTIONS = {
     "won't": "will not", "don't": "do not", "doesn't": "does not"
 }
 
+PRODUCT_TYPES = {"chairs","chair","chargers","charger","barstools","barstool","stools","stool","lounge","rattan","linens","glass","glasses","flatware","china"}
+
 def normalize_text(s: str) -> str:
     s = (s or "").lower().strip()
-    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    s = s.replace("’","'").replace("“", '"').replace("”", '"')
     for k, v in CONTRACTIONS.items():
         s = s.replace(k, v)
     s = re.sub(r"\bwhats\b", "what is", s)
-    # apply aliases
+
+    # NEW: "X in Y" → "Y X" when X looks like a product type
+    s = re.sub(
+        rf"\b({'|'.join(sorted(PRODUCT_TYPES))})\s+in\s+([a-z][a-z\s]{{1,20}})\b",
+        r"\2 \1",
+        s
+    )
+
+    # existing alias pass
     for k, v in ALIASES.items():
         s = re.sub(rf"\b{k}\b", v, s)
+
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -193,6 +230,16 @@ def jaccard_tokens(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+def cosine_sim(a: List[float] | None, b: List[float] | None) -> float:
+    if not a or not b: 
+        return 0.0
+    s = sum(x*y for x, y in zip(a, b))
+    na = sum(x*x for x in a) ** 0.5
+    nb = sum(y*y for y in b) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return s / (na * nb)
+
 def _enrich_tokens_with_aliases(tokens: set[str]) -> set[str]:
     """Add common variants for any canonical token based on REV_ALIASES (without removing canonicals)."""
     out = set(tokens)
@@ -202,17 +249,25 @@ def _enrich_tokens_with_aliases(tokens: set[str]) -> set[str]:
             out.update(REV_ALIASES[t])
     return out
 
+STOPWORDS = {
+    "do","you","have","show","me","in","the","a","an","to","of","for",
+    "on","at","and","or","please","can","could","would","is","are"
+}
+
+
 def _tokens_for_matching(*parts: str) -> set[str]:
-    """Normalize each part, split to tokens, union, then enrich with alias variants."""
+    """Normalize each part, split to tokens, drop stopwords, then enrich with alias variants."""
     tokens: set[str] = set()
     for p in parts:
-        if not p: 
+        if not p:
             continue
         norm = normalize_text(p)
         if not norm:
             continue
-        tokens.update(norm.split())
+        # NEW: drop stopwords here
+        tokens.update(t for t in norm.split() if t not in STOPWORDS)
     return _enrich_tokens_with_aliases(tokens)
+
 
 
 # -------------------------
@@ -597,15 +652,61 @@ class LightweightAIEngine:
 
     # Lightweight "embedding"
     def get_embedding(self, text: str) -> List[float]:
-        words = normalize_text(text).split()
+        # Prefer real embeddings; fall back to lightweight features.
+        txt = limit_len(text or "", 2000)
+        if self.openai_client:
+            try:
+                resp = self.openai_client.embeddings.create(
+                    model=Config.OPENAI_EMBEDDING_MODEL,
+                    input=txt
+                )
+                emb = resp.data[0].embedding
+                if isinstance(emb, list) and emb:
+                    return emb
+            except Exception as e:
+                logger.warning("Embedding API failed, using lightweight fallback: %r", e)
+
+    # Fallback: lightweight 10-dim features (simple & deterministic)
+    words_norm = normalize_text(txt).split()
+    punct_count = sum(ch in "?!." for ch in (text or ""))
+
+    features = [
+        float(len(words_norm)),
+        float(sum(len(w) for w in words_norm) / max(1, len(words_norm))),
+        float(any(c.isdigit() for w in words_norm for c in w)),
+        float(punct_count),
+    ]
+    while len(features) < 10:
+        features.append(0.0)
+    return features[:10]
+    
+        # Fallback: lightweight 10-dim features (keep simple & deterministic)
+        words_norm = normalize_text(txt).split()
+        # count punctuation from raw text (normalize_text strips it)
+        punct_count = sum(ch in "?!." for ch in (text or ""))
+    
+        features = [
+            float(len(words_norm)),
+            float(sum(len(w) for w in words_norm) / max(1, len(words_norm))),
+            float(any(c.isdigit() for w in words_norm for c in w)),
+            float(punct_count),
+        ]
+        while len(features) < 10:
+            features.append(0.0)
+        return features[:10]
+    
+        # Fallback: your existing lightweight 10-dim features
+        words = normalize_text(txt).split()
         features = [
             float(len(words)),
             float(sum(len(w) for w in words) / max(1, len(words))),
             float(sum(1 for w in words if any(c.isdigit() for c in w))),
             float(sum(1 for w in words if ('?' in w or '!' in w))),
         ]
-        while len(features) < 10: features.append(0.0)
+        while len(features) < 10: 
+            features.append(0.0)
         return features[:10]
+
 
     def breakers_status(self) -> Dict[str, Any]:
         return {"stt": self.cb_stt.status(), "chat": self.cb_chat.status()}
@@ -810,64 +911,82 @@ class KnowledgeBaseManager:
         await self.db.save_knowledge_item(item)
 
     async def find_answer(self, question: str) -> Tuple[str, float, Optional[str]]:
+        """
+        KB lookup with alias-aware token matching + fuzzy + embedding cosine.
+        Returns (answer, confidence, kb_item_id_or_None).
+        """
         if not self.knowledge_items:
             return "", 0.0, None
+    
+        # Normalize / prepare query representations
         q_norm = normalize_text(question)
-        # Build enriched token set for the query (includes alias variants)
         q_tokens = _tokens_for_matching(question)
-        # Heuristic: product-intent queries get a small boost when KB items have URLs
-        product_intent = ai_engine._catalog_intent(question) if hasattr(ai_engine, "_catalog_intent") else False
-     
+    
+        # Detect product intent (short nouny queries)
+        product_intent = False
+        if hasattr(self.ai, "_catalog_intent"):
+            try:
+                product_intent = self.ai._catalog_intent(question)
+            except Exception:
+                product_intent = False
+    
+        # One-time query embedding
+        try:
+            q_emb = self.ai.get_embedding(question)
+        except Exception:
+            q_emb = None
+    
         best_ans, best_sim, best_id = "", 0.0, None
+    
         for it in self.knowledge_items:
-            # Combine item fields for matching
+            # Compose item text for matching (include tags & nav path)
             item_text = it.question
-            # incorporate tags and nav_path into matching text without polluting stored answers
             if it.tags:
                 item_text += " " + it.tags
             if it.nav_path:
                 item_text += " " + it.nav_path.replace("→", " ").replace("/", " ")
+    
             it_norm = normalize_text(item_text)
-
-            # Token-based similarity with alias enrichment
             it_tokens = _tokens_for_matching(item_text)
-            # Jaccard over enriched token sets (guard div-by-zero inside helper)
-            j = 0.0
-            if q_tokens and it_tokens:
-                j = len(q_tokens & it_tokens) / len(q_tokens | it_tokens)
-
-            # Character-level fuzzy as a backstop
+    
+            # Token Jaccard
+            j = (len(q_tokens & it_tokens) / len(q_tokens | it_tokens)) if (q_tokens and it_tokens) else 0.0
+    
+            # Character-level fuzzy
             s = SequenceMatcher(None, q_norm, it_norm).ratio()
-
-            sim = max(j, s * 0.9)
-
-            # Bonus 1: tag overlap (bounded)
-            tag_bonus = 0.0
+    
+            # Embedding cosine
+            embed_sim = cosine_sim(q_emb, it.embedding) if it.embedding else 0.0
+    
+            # Combine: strongest of the three signals
+            sim = max(j, s * 0.90, embed_sim * 0.90)
+    
+            # Tag overlap bonus (bounded)
             if it.tags:
                 tag_tokens = _tokens_for_matching(it.tags)
                 if tag_tokens:
                     overlap = len(q_tokens & tag_tokens)
                     denom = max(1, len(tag_tokens))
-                    tag_bonus = min(0.12, 0.12 * (overlap / denom))  # up to +0.12
-                    sim += tag_bonus
-
-            # Bonus 2: product intent + URL present (bounded)
+                    sim += min(0.12, 0.12 * (overlap / denom))
+    
+            # Product intent + URL present = small bump
             if product_intent and it.url:
                 sim += 0.05
-
-            # cap similarity
+    
             if sim > 1.0:
-                sim = 1.0            
+                sim = 1.0
+    
             if sim > best_sim and sim >= Config.SIMILARITY_THRESHOLD:
-                # If metadata is present, stitch it into the answer tail
                 meta_tail = []
                 if it.nav_path: meta_tail.append(f"Menu path: {it.nav_path}")
                 if it.url: meta_tail.append(f"Link: {it.url}")
                 if it.tags: meta_tail.append(f"Tags: {it.tags}")
                 extra = ("\n" + " • ".join(meta_tail)) if meta_tail else ""
-                best_ans, best_sim, best_id = it.answer + extra, sim, it.id
+                best_ans, best_sim, best_id = limit_len(it.answer, Config.MAX_INPUT_LEN) + extra, sim, it.id
+    
         if best_id:
             await self.db.increment_usage_count(best_id)
+    
         return best_ans, best_sim, best_id
 
 # ------------------------------------------------------------------------------
@@ -1477,15 +1596,12 @@ a.link { color:#7dd3fc; text-decoration:none }
 
 @app.get("/api/knowledge/export_csv")
 async def api_export_kb_csv():
-    """
-    Export the knowledge base as a CSV file.
-    Columns: id, question, answer, source, url, nav_path, tags, usage_count, last_updated
-    """
     items = await db_manager.get_knowledge_base()
 
     def generate():
         import csv, io
         buf = io.StringIO()
+        buf.write("\ufeff")  # BOM for Excel
         writer = csv.writer(buf)
         writer.writerow(["id","question","answer","source","url","nav_path","tags","usage_count","last_updated"])
         for it in items:
@@ -1504,9 +1620,10 @@ async def api_export_kb_csv():
         yield buf.read()
 
     headers = {
-        "Content-Disposition": 'attachment; filename="knowledge_base.csv"'
+        "Content-Disposition": 'attachment; filename="knowledge_base.csv"',
+        "Content-Type": "text/csv; charset=utf-8"
     }
-    return StreamingResponse(generate(), media_type="text/csv", headers=headers)
+    return StreamingResponse(generate(), headers=headers)
 
 
 @app.get("/chat", response_class=HTMLResponse)
@@ -1864,6 +1981,22 @@ async def api_scrape(payload: Dict[str, Any]):
         logger.exception("Scrape failed")
         return JSONResponse({"status":"error","message":"scrape_failed"}, status_code=500)
 
+@app.post("/api/knowledge/backfill_embeddings")
+async def api_backfill_embeddings():
+    items = await db_manager.get_knowledge_base()
+    updated = 0
+    for it in items:
+        if not it.embedding:
+            try:
+                it.embedding = ai_engine.get_embedding(it.question)
+                it.last_updated = now_utc()
+                await db_manager.save_knowledge_item(it)
+                updated += 1
+            except Exception as e:
+                logger.warning("Embedding backfill failed for %s: %r", it.id, e)
+    return {"status": "success", "updated": updated, "total": len(items)}
+
+
 @app.get("/api/knowledge/unknown")
 async def api_unknown():
     qs = await db_manager.get_unknown_questions(resolved=False)
@@ -1906,70 +2039,90 @@ async def voice_websocket(websocket: WebSocket):
     call_id = f"call_{uuid4().hex}"
     if not connection_tracker.add(call_id):
         await websocket.send_json({"type": "error", "message": "Server at capacity. Try again later."})
-        await websocket.close(code=1013); return
+        await websocket.close(code=1013)
+        return
+
     call_created = False
     try:
-        call = Call(call_id=call_id, caller_info="websocket", start_time=now_utc()); call_created = True
+        call = Call(call_id=call_id, caller_info="websocket", start_time=now_utc())
+        call_created = True
         logger.info(f"Call started: {call_id} (active={connection_tracker.count()})")
+
         start_ts = time.monotonic()
         client_ip = websocket.client.host if websocket.client else "unknown"
         if not rate_limiter.is_allowed(client_ip):
             await websocket.send_json({"type": "error", "message": "Rate limit exceeded for your IP."})
-            await websocket.close(code=1008); return
-        audio_buffer: List[bytes] = []; buffer_lock = asyncio.Lock(); last_process_time = time.monotonic()
+            await websocket.close(code=1008)
+            return
+
+        audio_buffer: List[bytes] = []
+        buffer_lock = asyncio.Lock()
+        last_process_time = time.monotonic()
+
+        ESCALATE = ["human","person","agent","representative","manager","supervisor","speak to someone"]
 
         while True:
+            # Guard max call length
             if time.monotonic() - start_ts > Config.MAX_CALL_DURATION:
                 await websocket.send_json({"type": "closing", "reason": "max_duration"})
-                await websocket.close(code=1000); call.outcome = call.outcome or "answered"; break
+                await websocket.close(code=1000)
+                call.outcome = call.outcome or "answered"
+                break
+
+            # Receive frame
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=Config.WEBSOCKET_TIMEOUT)
             except asyncio.TimeoutError:
-                await websocket.send_json({"type": "heartbeat"}); continue
+                await websocket.send_json({"type": "heartbeat"})
+                continue
             except Exception:
                 break
-            if msg.get("type") == "websocket.disconnect": break
 
-            # Text frames (browser STT/control)
-            # ---- TEXT FRAME PATH (browser STT / control messages) ----
+            if msg.get("type") == "websocket.disconnect":
+                break
+
+            # -----------------------------
+            # TEXT FRAMES (browser STT / control)
+            # -----------------------------
             if "text" in msg and msg["text"] is not None:
                 try:
                     payload = json.loads(msg["text"])
                 except Exception:
                     payload = {"type": "text", "text": msg["text"]}
-            
+
                 if payload.get("type") == "ping":
                     await websocket.send_json({"type": "heartbeat"})
                     continue
-            
+
                 if payload.get("type") == "text":
                     text = (payload.get("text") or "").strip()
                     if not text:
                         await websocket.send_json({"type": "listening"})
                         continue
-            
+
                     call.transcript += f"User: {text}\n"
-            
-                    # KB lookup first
+
+                    # 1) KB first
                     answer, confidence, _ = await knowledge_manager.find_answer(text)
                     if confidence >= Config.CONFIDENCE_THRESHOLD:
                         response_text = answer
                         call.outcome = call.outcome or "answered"
+                        src_for_unknown = "kb"
                     else:
-                        # optional human escalation
-                        if any(k in text.lower() for k in ["human","person","agent","representative","manager","supervisor","speak to someone"]):
+                        # Optional human escalation
+                        if any(k in text.lower() for k in ESCALATE):
                             await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
                             await websocket.send_json({"type": "closing", "reason": "transfer"})
                             await websocket.close(code=1000)
                             call.outcome = "transferred"
                             break
-            
-                        # LLM/rules
+
+                        # 2) LLM/rules fallback
                         response_text = await ai_engine.generate_response(text)
-            
-                        # Save unknown only if gating passes
-                        src = ai_engine.last_source or "rules"
-                        if should_record_unknown(text, response_text, src, confidence):
+                        src_for_unknown = ai_engine.last_source or "rules"
+
+                        # Record as unknown if gating permits
+                        if should_record_unknown(text, response_text, src_for_unknown, confidence):
                             uq = UnknownQuestion(
                                 id=f"unknown_{uuid4().hex}",
                                 question=text,
@@ -1977,69 +2130,95 @@ async def voice_websocket(websocket: WebSocket):
                                 timestamp=now_utc(),
                                 suggested_answer=response_text
                             )
-                            await db_manager.save_unknown_question(uq)            
-                        call.transcript += f"Agent: {response_text}\n"
-                        call.confidence_score = confidence
-            
+                            await db_manager.save_unknown_question(uq)
+
+                    # Always log agent reply + confidence
+                    call.transcript += f"Agent: {response_text}\n"
+                    call.confidence_score = confidence
+
                     # TTS
                     audio_bytes = await ai_engine.text_to_speech(response_text)
-            
-                    # Decide source for UI
+
+                    # Source for UI
                     if confidence >= Config.CONFIDENCE_THRESHOLD:
-                        source = "kb"
+                        ui_source = "kb"
                     else:
-                        if response_text == AI_UNAVAILABLE_MSG:
-                            source = "llm_unavailable"
-                        else:
-                            source = ai_engine.last_source or "rules"
-            
+                        ui_source = "llm_unavailable" if response_text == AI_UNAVAILABLE_MSG else src_for_unknown
+
                     await websocket.send_json({
                         "type": "response",
                         "text": response_text,
                         "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
                         "audio_mime": Config.AUDIO_TTS_MIME,
                         "confidence": confidence,
-                        "source": source
+                        "source": ui_source,
                     })
                     continue
-            
-                # any other control messages
+
+                # Unrecognized control
                 await websocket.send_json({"type": "error", "message": "unrecognized_control_message"})
                 continue
 
-
-            # Binary frames (mic audio)
+            # -----------------------------
+            # BINARY FRAMES (mic audio)
+            # -----------------------------
             data: Optional[bytes] = msg.get("bytes")
             if not data:
-                await websocket.send_json({"type":"noop"}); continue
+                await websocket.send_json({"type": "noop"})
+                continue
             if len(data) > Config.MAX_AUDIO_SIZE:
-                await websocket.send_json({"type":"error","message":"audio_frame_too_large"}); continue
+                await websocket.send_json({"type": "error", "message": "audio_frame_too_large"})
+                continue
+
+            # Buffer + batch for STT
             async with buffer_lock:
                 audio_buffer.append(data)
-                should_process = len(audio_buffer) >= Config.AUDIO_BUFFER_SIZE or (time.monotonic() - last_process_time) > 2.0
+                should_process = (
+                    len(audio_buffer) >= Config.AUDIO_BUFFER_SIZE
+                    or (time.monotonic() - last_process_time) > 2.0
+                )
                 if should_process:
-                    batch = b"".join(audio_buffer); audio_buffer.clear(); last_process_time = time.monotonic()
+                    batch = b"".join(audio_buffer)
+                    audio_buffer.clear()
+                    last_process_time = time.monotonic()
                 else:
                     batch = None
-            if not batch: continue
-            if len(batch) > Config.MAX_COMBINED_AUDIO:
-                await websocket.send_json({"type": "error", "message": "audio_combination_too_large"}); continue
 
+            if not batch:
+                continue
+            if len(batch) > Config.MAX_COMBINED_AUDIO:
+                await websocket.send_json({"type": "error", "message": "audio_combination_too_large"})
+                continue
+
+            # STT
             text = await ai_engine.speech_to_text(batch)
             if not text:
-                await websocket.send_json({"type":"listening"}); continue
+                await websocket.send_json({"type": "listening"})
+                continue
+
             call.transcript += f"User: {text}\n"
+
+            # 1) KB first
             answer, confidence, _ = await knowledge_manager.find_answer(text)
             if confidence >= Config.CONFIDENCE_THRESHOLD:
-                response_text = answer; call.outcome = call.outcome or "answered"
+                response_text = answer
+                call.outcome = call.outcome or "answered"
+                src_for_unknown = "kb"
             else:
-                if any(k in text.lower() for k in ["human","person","agent","representative","manager","supervisor","speak to someone"]):
+                # Optional human escalation
+                if any(k in text.lower() for k in ESCALATE):
                     await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
                     await websocket.send_json({"type": "closing", "reason": "transfer"})
-                    await websocket.close(code=1000); call.outcome = "transferred"; break
+                    await websocket.close(code=1000)
+                    call.outcome = "transferred"
+                    break
+
+                # 2) LLM/rules fallback
                 response_text = await ai_engine.generate_response(text)
-                src = ai_engine.last_source or "rules"
-                if should_record_unknown(text, response_text, src, confidence):
+                src_for_unknown = ai_engine.last_source or "rules"
+
+                # Record as unknown if gating permits
+                if should_record_unknown(text, response_text, src_for_unknown, confidence):
                     uq = UnknownQuestion(
                         id=f"unknown_{uuid4().hex}",
                         question=text,
@@ -2047,17 +2226,20 @@ async def voice_websocket(websocket: WebSocket):
                         timestamp=now_utc(),
                         suggested_answer=response_text
                     )
-                    await db_manager.save_unknown_question(uq)            
-                    call.transcript += f"Agent: {response_text}\n"
-                    call.confidence_score = confidence
+                    await db_manager.save_unknown_question(uq)
+
+            # Always log agent reply + confidence
+            call.transcript += f"Agent: {response_text}\n"
+            call.confidence_score = confidence
+
+            # TTS
             audio_bytes = await ai_engine.text_to_speech(response_text)
+
+            # Source for UI
             if confidence >= Config.CONFIDENCE_THRESHOLD:
-                source = "kb"
+                ui_source = "kb"
             else:
-                if response_text == AI_UNAVAILABLE_MSG:
-                    source = "llm_unavailable"
-                else:
-                    source = ai_engine.last_source or "rules"
+                ui_source = "llm_unavailable" if response_text == AI_UNAVAILABLE_MSG else src_for_unknown
 
             await websocket.send_json({
                 "type": "response",
@@ -2065,16 +2247,17 @@ async def voice_websocket(websocket: WebSocket):
                 "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
                 "audio_mime": Config.AUDIO_TTS_MIME,
                 "confidence": confidence,
-                "source": source
+                "source": ui_source,
             })
-
 
     except WebSocketDisconnect:
         logger.info(f"Call disconnected: {call_id}")
     except Exception as e:
         logger.error(f"WebSocket error ({call_id}): {e}")
-        try: await websocket.send_json({"type":"error","message":"internal_error"})
-        except Exception: pass
+        try:
+            await websocket.send_json({"type": "error", "message": "internal_error"})
+        except Exception:
+            pass
     finally:
         connection_tracker.remove(call_id)
         if call_created:
@@ -2084,6 +2267,7 @@ async def voice_websocket(websocket: WebSocket):
             except Exception as e:
                 logger.error(f"Failed to persist call {call_id}: {e}")
         logger.info(f"Call ended: {call_id} (active={connection_tracker.count()})")
+
 
 # ------------------------------------------------------------------------------
 # Health
