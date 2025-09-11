@@ -758,6 +758,7 @@ class WebScraper:
         self.max_pages = max_pages
         self.timeout = timeout
         self.concurrency = concurrency
+        self.last_pages_scanned = 0  # track real fetched page count
 
         # very conservative denylists to avoid trash pages
         self.deny_substrings = [
@@ -789,19 +790,39 @@ class WebScraper:
             return False
 
     def _canonical(self, url: str) -> str:
-        # strip fragments & tracking params; normalize
         pr = urlparse(url)
         if not pr.scheme or not pr.netloc:
             return ""
-        qs = []
-        for k, v in [p.split("=", 1) if "=" in p else (p, "") for p in pr.query.split("&") if p]:
+    
+        # lower-case scheme/host
+        scheme = pr.scheme.lower()
+        netloc = pr.netloc.lower()
+    
+        # normalize path: drop common index files and trailing slash (except root)
+        path = re.sub(r"/index\.(?:html?|php)$", "/", pr.path)
+        if len(path) > 1 and path.endswith("/"):
+            path = path[:-1]
+    
+        # drop common tracking params; sort remaining params for stable ordering
+        tracking = {
+            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+            "gclid", "fbclid", "mc_cid", "mc_eid"
+        }
+        kv = []
+        for p in [x for x in pr.query.split("&") if x]:
+            k, v = p.split("=", 1) if "=" in p else (p, "")
             k_low = k.lower()
-            if k_low in ("utm_source","utm_medium","utm_campaign","utm_term","utm_content","gclid","fbclid","mc_cid","mc_eid"):
+            if k_low in tracking:
                 continue
-            qs.append(f"{k}={v}" if v else k)
-        query = "&".join(qs)
-        canon = pr._replace(fragment="", query=query).geturl()
-        return canon
+            kv.append((k_low, v))
+        kv.sort()
+        query = "&".join(f"{k}={v}" if v else k for k, v in kv)
+    
+        # strip fragments and rebuild
+        return pr._replace(
+            scheme=scheme, netloc=netloc, path=path, params="", query=query, fragment=""
+        ).geturl()
+
 
     def _should_visit(self, url: str) -> bool:
         if not self._allowed_host(url):
@@ -809,11 +830,11 @@ class WebScraper:
         low = url.lower()
         if any(s in low for s in self.deny_substrings):
             return False
-        # Prefer catalog/product-ish pages
         if any(c in low for c in self.allow_cues):
             return True
-        # Also allow home, shop roots, category roots
-        return low.rstrip("/").count("/") <= 3
+        # Use path-only depth (e.g., /product/sku -> depth=2)
+        depth = urlparse(url).path.rstrip("/").count("/")
+        return depth <= 2
 
     def _discover_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
         links = set()
@@ -884,27 +905,63 @@ class WebScraper:
     async def _fetch(self, client: httpx.AsyncClient, url: str) -> tuple[str, Optional[BeautifulSoup]]:
         try:
             r = await client.get(url, headers={"User-Agent": "TablescapesBot/1.0 (+crawl=limited)"})
-            if r.status_code != 200: return url, None
-            ctype = r.headers.get("content-type","")
-            if "text/html" not in ctype: return url, None
-            return url, BeautifulSoup(r.text, "html.parser")
+            if r.status_code != 200:
+                return url, None
+            ctype = r.headers.get("content-type", "")
+            if "text/html" not in ctype:
+                return url, None
+    
+            soup = BeautifulSoup(r.text, "html.parser")
+    
+            # NEW: honor <link rel="canonical"> to reduce duplicates
+            try:
+                can_link = soup.find("link", rel=lambda v: v and "canonical" in v)
+                if can_link and can_link.get("href"):
+                    can_href = self._canonical(urljoin(url, can_link["href"]))
+                    if can_href:
+                        url = can_href
+            except Exception:
+                pass
+    
+            return url, soup
         except Exception:
             return url, None
 
+
     async def _sitemap_seed(self, client: httpx.AsyncClient, base_root: str) -> list[str]:
-        seeds = []
-        for path in ("/sitemap_index.xml", "/sitemap.xml"):
+        seeds: list[str] = []
+    
+        async def extract_locs(xml_url: str) -> list[str]:
             try:
-                r = await client.get(urljoin(base_root, path))
-                if r.status_code != 200 or "xml" not in r.headers.get("content-type",""): continue
+                r = await client.get(xml_url)
+                if r.status_code != 200 or "xml" not in r.headers.get("content-type",""):
+                    return []
                 xml = r.text
-                locs = re.findall(r"<loc>(.*?)</loc>", xml, flags=re.I)
-                for loc in locs:
-                    if self._allowed_host(loc):
-                        seeds.append(loc.strip())
+                return [m.strip() for m in re.findall(r"<loc>(.*?)</loc>", xml, flags=re.I)]
             except Exception:
-                pass
-        return seeds[: self.max_pages // 2]  # keep balanced
+                return []
+    
+        # Try index first; fall back to plain sitemap
+        for path in ("/sitemap_index.xml", "/sitemap.xml"):
+            locs = await extract_locs(urljoin(base_root, path))
+            # If it's an index, fetch each child sitemap and collect their locs
+            expanded: list[str] = []
+            for loc in locs:
+                if loc.lower().endswith(".xml"):
+                    expanded += await extract_locs(loc)
+                else:
+                    expanded.append(loc)
+    
+            for u in expanded or locs:
+                if self._allowed_host(u):
+                    seeds.append(u)
+    
+            if seeds:
+                break  # we found something useful; stop trying the other path
+    
+        # keep it balanced relative to max_pages
+        return seeds[: self.max_pages // 2]
+
 
     def _deep_search_seeds(self, base_root: str) -> list[str]:
         # build /shop/ etc plus color/keyword searches (Woo pattern)
@@ -928,10 +985,29 @@ class WebScraper:
         results: list[dict[str, str]] = []
         seen: set[str] = set()
         queue: list[str] = []
+        queued: set[str] = set()   # URLs currently enqueued (but not fetched yet)
+
 
         # initial seeds
         base_root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-        queue.append(self._canonical(base_url))
+        # Seed with the exact URL the user passed
+        root = self._canonical(base_url)
+        if root and self._should_visit(root) and root not in seen:
+            if root not in queue:
+                queue.append(root)
+            try:
+                queued.add(root)   # ok if you already added `queued` in a later step
+            except NameError:
+                pass               # if `queued` doesn't exist yet, ignore for now
+        
+        # Also seed the site home (base_root), which often fan-outs to categories
+        home = self._canonical(base_root)
+        if home and self._should_visit(home) and home not in seen and home not in queue:
+            queue.append(home)
+            try:
+                queued.add(home)
+            except NameError:
+                pass
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             # add sitemap seeds
             if deep:
@@ -954,7 +1030,16 @@ class WebScraper:
                     if not can or can in seen or not self._should_visit(can): return [], []
                     seen.add(can)
                     url, soup = await self._fetch(client, can)
-                    if not soup: return [], []
+                    if not soup:
+                        return [], []
+
+                    
+                    # NEW: if _fetch() rewrote to a canonical URL, use it for de-duping
+                    if url != can:
+                        if url in seen:
+                            return [], []          # already crawled canonical; skip
+                        seen.add(url)               # mark canonical as seen going forward
+ 
                     text = self._clean_text(soup.get_text(" "))
                     qa = self._extract_qa(text, url)
                     if not qa:
@@ -983,6 +1068,7 @@ class WebScraper:
                         queue.append(n)
 
         logger.info(f"Scrape finished: pages_scanned={len(seen)} items={len(results)} deep={deep}")
+        self.last_pages_scanned = len(seen)
         return results
 
 # ------------------------------------------------------------------------------
@@ -991,7 +1077,12 @@ class WebScraper:
 db_manager = DatabaseManager(Config.DATABASE_PATH)
 ai_engine = LightweightAIEngine()
 knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
-scraper = WebScraper(Config.ALLOWED_SCRAPE_HOSTS, Config.SCRAPE_MAX_PAGES, Config.SCRAPE_TIMEOUT)
+scraper = WebScraper(
+    Config.ALLOWED_SCRAPE_HOSTS,
+    Config.SCRAPE_MAX_PAGES,
+    Config.SCRAPE_TIMEOUT,
+    Config.SCRAPE_CONCURRENCY,
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1579,9 +1670,15 @@ async def api_scrape(payload: Dict[str, Any]):
                 url=item.get("source")
             )
             added += 1
-        pages = len({x.get("source") for x in qa}) or 0
-        return {"status":"success","message":f"Scraped {len(qa)} items; added {added}",
-                "pages_scanned": pages, "deep": deep, "max_pages_effective": max_pages or Config.SCRAPE_MAX_PAGES}
+        pages_scanned = getattr(scraper, "last_pages_scanned", 0)
+        return {
+            "status": "success",
+            "message": f"Scraped {len(qa)} items; added {added}",
+            "pages_scanned": pages_scanned,
+            "deep": deep,
+            "max_pages_effective": max_pages or Config.SCRAPE_MAX_PAGES,
+        }
+
     except ValueError as ve:
         return JSONResponse({"status":"error","message":str(ve)}, status_code=400)
     except Exception:
