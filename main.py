@@ -652,33 +652,35 @@ class LightweightAIEngine:
 
     # Lightweight "embedding"
     def get_embedding(self, text: str) -> List[float]:
-        # Prefer real embeddings; fall back to lightweight features.
+        # Prefer real embeddings; fall back to lightweight, deterministic features.
         txt = limit_len(text or "", 2000)
+    
         if self.openai_client:
             try:
                 resp = self.openai_client.embeddings.create(
                     model=Config.OPENAI_EMBEDDING_MODEL,
-                    input=txt
+                    input=txt,
                 )
                 emb = resp.data[0].embedding
                 if isinstance(emb, list) and emb:
                     return emb
             except Exception as e:
                 logger.warning("Embedding API failed, using lightweight fallback: %r", e)
-
-    # Fallback: lightweight 10-dim features (simple & deterministic)
-    words_norm = normalize_text(txt).split()
-    punct_count = sum(ch in "?!." for ch in (text or ""))
-
-    features = [
-        float(len(words_norm)),
-        float(sum(len(w) for w in words_norm) / max(1, len(words_norm))),
-        float(any(c.isdigit() for w in words_norm for c in w)),
-        float(punct_count),
-    ]
-    while len(features) < 10:
-        features.append(0.0)
-    return features[:10]
+    
+        # ---- Fallback: lightweight 10-dim feature vector ----
+        words_norm = normalize_text(txt).split()
+        # count punctuation from the *raw* text (normalize_text strips it)
+        punct_count = sum(1 for ch in (text or "") if ch in "?!.")
+    
+        features = [
+            float(len(words_norm)),  # token count
+            float(sum(len(w) for w in words_norm) / max(1, len(words_norm))),  # avg token len
+            float(any(any(c.isdigit() for c in w) for w in words_norm)),  # any digits
+            float(punct_count),  # punctuation signal
+        ]
+        while len(features) < 10:
+            features.append(0.0)
+        return features[:10]
     
         # Fallback: lightweight 10-dim features (keep simple & deterministic)
         words_norm = normalize_text(txt).split()
