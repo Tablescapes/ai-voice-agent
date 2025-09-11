@@ -29,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from fastapi.responses import StreamingResponse
 
 from openai import OpenAI
 from gtts import gTTS
@@ -160,6 +161,11 @@ ALIASES = {
     "dancefloor": "dance floor",
 }
 
+# Reverse map to recover common variants for a canonical term (for matching bonus)
+REV_ALIASES: Dict[str, List[str]] = {}
+for k, v in ALIASES.items():
+    REV_ALIASES.setdefault(v, []).append(k)
+
 CONTRACTIONS = {
     "what's": "what is", "who's": "who is", "where's": "where is",
     "i'm": "i am", "you're": "you are", "it's": "it is",
@@ -185,6 +191,71 @@ def jaccard_tokens(a: str, b: str) -> float:
     if not ta and not tb: return 1.0
     if not ta or not tb:  return 0.0
     return len(ta & tb) / len(ta | tb)
+
+
+def _enrich_tokens_with_aliases(tokens: set[str]) -> set[str]:
+    """Add common variants for any canonical token based on REV_ALIASES (without removing canonicals)."""
+    out = set(tokens)
+    for t in list(tokens):
+        # if t is canonical, add its known variants
+        if t in REV_ALIASES:
+            out.update(REV_ALIASES[t])
+    return out
+
+def _tokens_for_matching(*parts: str) -> set[str]:
+    """Normalize each part, split to tokens, union, then enrich with alias variants."""
+    tokens: set[str] = set()
+    for p in parts:
+        if not p: 
+            continue
+        norm = normalize_text(p)
+        if not norm:
+            continue
+        tokens.update(norm.split())
+    return _enrich_tokens_with_aliases(tokens)
+
+
+# -------------------------
+# Small-talk / unknown gating
+# -------------------------
+_SMALL_TALK_PATTERNS = [
+    "are you there", "you there", "can you hear me", "hello", "hi", "hey",
+    "good morning", "good afternoon", "good evening",
+    "what's your name", "whats your name", "what is your name", "who are you", "your name",
+    "what can you do", "what do you do", "capabilities",
+    "thanks", "thank you", "thx", "appreciate it",
+    "bye", "goodbye", "see ya", "see you"
+]
+
+def is_small_talk(text: str) -> bool:
+    if not text: 
+        return False
+    t = (text or "").lower().strip()
+    return any(p in t for p in _SMALL_TALK_PATTERNS)
+
+def is_rental_guide_reply(reply_text: str) -> bool:
+    # Heuristic: our dance-floor helper formats bullets and a "Browse options:" tail.
+    if not reply_text:
+        return False
+    r = reply_text.lower()
+    return ("dance floor" in r) and ("browse options:" in r)
+
+def should_record_unknown(user_text: str, reply_text: str, source: str, confidence: float) -> bool:
+    # Only record when: not in KB, below confidence threshold, not small-talk, not catalog link/guide, not AI-unavailable.
+    if not reply_text:
+        return False
+    if reply_text == AI_UNAVAILABLE_MSG:
+        return False
+    if confidence >= Config.CONFIDENCE_THRESHOLD:
+        return False
+    if is_small_talk(user_text) or is_small_talk(reply_text):
+        return False
+    if (source or "").lower() == "search_link":
+        return False
+    if is_rental_guide_reply(reply_text):
+        return False
+    return True
+
 
 # ------------------------------------------------------------------------------
 # Data models
@@ -462,6 +533,7 @@ class LightweightAIEngine:
         user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
         u = (user_input or "").strip()
         ul = u.lower()
+        llm_unavailable = False
 
         # Catalog: short noun-phrases → direct search link
         if self._catalog_intent(u):
@@ -473,6 +545,7 @@ class LightweightAIEngine:
         if guide:
             self.last_source = "rules"; return guide
 
+        # Try LLM
         # Try LLM
         if self.openai_client and self.cb_chat.can_call():
             try:
@@ -493,8 +566,11 @@ class LightweightAIEngine:
                     self.last_source = "llm"; return text
             except Exception as e:
                 self.cb_chat.record_failure()
+                llm_unavailable = True
                 logger.error("Chat error: %r", e)
-
+        else:
+            # No client or breaker is open
+            llm_unavailable = True
         # Rules fallback (small talk etc.)
         if not ul:
             self.last_source = "rules"; return "Could you repeat that?"
@@ -511,7 +587,13 @@ class LightweightAIEngine:
             self.last_source = "rules"; return "You’re welcome!"
         if any(p in ul for p in ["bye","goodbye","see ya","see you"]):
             self.last_source = "rules"; return "Thanks for visiting—talk soon."
-        self.last_source = "rules"; return "I can help with that. Could you clarify the item or topic?"
+        # If we land here, no rule matched. If LLM is unavailable, surface it explicitly.
+        if llm_unavailable:
+            self.last_source = "llm_unavailable"
+            return AI_UNAVAILABLE_MSG
+        # Otherwise, keep the generic rules fallback.
+        self.last_source = "rules"
+        return "I can help with that. Could you clarify the item or topic?"
 
     # Lightweight "embedding"
     def get_embedding(self, text: str) -> List[float]:
@@ -731,12 +813,51 @@ class KnowledgeBaseManager:
         if not self.knowledge_items:
             return "", 0.0, None
         q_norm = normalize_text(question)
+        # Build enriched token set for the query (includes alias variants)
+        q_tokens = _tokens_for_matching(question)
+        # Heuristic: product-intent queries get a small boost when KB items have URLs
+        product_intent = ai_engine._catalog_intent(question) if hasattr(ai_engine, "_catalog_intent") else False
+     
         best_ans, best_sim, best_id = "", 0.0, None
         for it in self.knowledge_items:
-            it_norm = normalize_text(it.question)
-            j = jaccard_tokens(q_norm, it_norm)
+            # Combine item fields for matching
+            item_text = it.question
+            # incorporate tags and nav_path into matching text without polluting stored answers
+            if it.tags:
+                item_text += " " + it.tags
+            if it.nav_path:
+                item_text += " " + it.nav_path.replace("→", " ").replace("/", " ")
+            it_norm = normalize_text(item_text)
+
+            # Token-based similarity with alias enrichment
+            it_tokens = _tokens_for_matching(item_text)
+            # Jaccard over enriched token sets (guard div-by-zero inside helper)
+            j = 0.0
+            if q_tokens and it_tokens:
+                j = len(q_tokens & it_tokens) / len(q_tokens | it_tokens)
+
+            # Character-level fuzzy as a backstop
             s = SequenceMatcher(None, q_norm, it_norm).ratio()
+
             sim = max(j, s * 0.9)
+
+            # Bonus 1: tag overlap (bounded)
+            tag_bonus = 0.0
+            if it.tags:
+                tag_tokens = _tokens_for_matching(it.tags)
+                if tag_tokens:
+                    overlap = len(q_tokens & tag_tokens)
+                    denom = max(1, len(tag_tokens))
+                    tag_bonus = min(0.12, 0.12 * (overlap / denom))  # up to +0.12
+                    sim += tag_bonus
+
+            # Bonus 2: product intent + URL present (bounded)
+            if product_intent and it.url:
+                sim += 0.05
+
+            # cap similarity
+            if sim > 1.0:
+                sim = 1.0            
             if sim > best_sim and sim >= Config.SIMILARITY_THRESHOLD:
                 # If metadata is present, stitch it into the answer tail
                 meta_tail = []
@@ -765,6 +886,8 @@ class WebScraper:
             "/cart", "/checkout", "/my-account", "/account", "/login", "/wp-admin",
             "/wp-json", "/feed", "/tag/", "/?add-to-cart=", "/?action=", "/?replytocom=",
             ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf", ".zip", ".mp4", ".mov",
+            "/privacy", "/terms", "/legal", "/cookies", "/cookie", "/gdpr",
+            "/about", "/contact", "/careers", "/jobs", "/press", "/blog", "/news", "/events",
         ]
 
         # allow cues for Woo/WordPress catalogs
@@ -827,15 +950,32 @@ class WebScraper:
     def _should_visit(self, url: str) -> bool:
         if not self._allowed_host(url):
             return False
+        pr = urlparse(url)
         low = url.lower()
+
+        # Hard denylists
         if any(s in low for s in self.deny_substrings):
             return False
+
+        # Block obvious date archives (e.g., /2025/09/, /2024/12/05/)
+        if re.search(r"/20\d{2}/\d{1,2}(/|\b)", pr.path):
+            return False
+
+        # Treat search as catalog only if it's product search
+        if "/?s=" in low or "search=" in low:
+            # allow if explicitly product search (WordPress/Woo or Shopify-ish)
+            if "post_type=product" in low or "/product/" in low or "/products/" in low:
+                return True
+            # else: generic site search -> skip
+            return False
+
+        # Explicit catalog cues always allowed
         if any(c in low for c in self.allow_cues):
             return True
-        # Use path-only depth (e.g., /product/sku -> depth=2)
-        depth = urlparse(url).path.rstrip("/").count("/")
-        return depth <= 2
 
+        # Generic paths: be strict. Only shallow depths to avoid news/about/etc.
+        depth = pr.path.rstrip("/").count("/")
+        return depth <= 1
     def _discover_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
         links = set()
 
@@ -985,29 +1125,19 @@ class WebScraper:
         results: list[dict[str, str]] = []
         seen: set[str] = set()
         queue: list[str] = []
-        queued: set[str] = set()   # URLs currently enqueued (but not fetched yet)
-
+       
 
         # initial seeds
         base_root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
         # Seed with the exact URL the user passed
         root = self._canonical(base_url)
-        if root and self._should_visit(root) and root not in seen:
-            if root not in queue:
-                queue.append(root)
-            try:
-                queued.add(root)   # ok if you already added `queued` in a later step
-            except NameError:
-                pass               # if `queued` doesn't exist yet, ignore for now
+        if root and self._should_visit(root) and root not in seen and root not in queue:
+            queue.append(root)
         
         # Also seed the site home (base_root), which often fan-outs to categories
         home = self._canonical(base_root)
         if home and self._should_visit(home) and home not in seen and home not in queue:
             queue.append(home)
-            try:
-                queued.add(home)
-            except NameError:
-                pass
         async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
             # add sitemap seeds
             if deep:
@@ -1027,18 +1157,19 @@ class WebScraper:
             async def crawl_one(u: str):
                 async with sem:
                     can = self._canonical(u)
-                    if not can or can in seen or not self._should_visit(can): return [], []
-                    seen.add(can)
+                    if not can or can in seen or not self._should_visit(can):
+                        return [], []
+                    # fetch first (it may rewrite to canonical via <link rel=canonical>)
                     url, soup = await self._fetch(client, can)
                     if not soup:
                         return [], []
 
                     
-                    # NEW: if _fetch() rewrote to a canonical URL, use it for de-duping
-                    if url != can:
-                        if url in seen:
-                            return [], []          # already crawled canonical; skip
-                        seen.add(url)               # mark canonical as seen going forward
+                    # Mark the effective canonical URL as seen (prefer rewritten URL if present)
+                    effective = url or can
+                    if effective in seen:
+                        return [], []
+                    seen.add(effective)
  
                     text = self._clean_text(soup.get_text(" "))
                     qa = self._extract_qa(text, url)
@@ -1063,9 +1194,12 @@ class WebScraper:
                 for t in asyncio.as_completed(tasks):
                     qa, nexts = await t
                     results.extend(qa)
+
                     for n in nexts:
-                        if len(seen) + len(queue) >= limit: break
-                        queue.append(n)
+                        if len(seen) + len(queue) >= limit:
+                            break
+                        if n not in seen and n not in queue and self._should_visit(n):
+                            queue.append(n)
 
         logger.info(f"Scrape finished: pages_scanned={len(seen)} items={len(results)} deep={deep}")
         self.last_pages_scanned = len(seen)
@@ -1341,6 +1475,40 @@ a.link { color:#7dd3fc; text-decoration:none }
 </html>
 """)
 
+@app.get("/api/knowledge/export_csv")
+async def api_export_kb_csv():
+    """
+    Export the knowledge base as a CSV file.
+    Columns: id, question, answer, source, url, nav_path, tags, usage_count, last_updated
+    """
+    items = await db_manager.get_knowledge_base()
+
+    def generate():
+        import csv, io
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["id","question","answer","source","url","nav_path","tags","usage_count","last_updated"])
+        for it in items:
+            writer.writerow([
+                it.id,
+                it.question or "",
+                it.answer or "",
+                it.source or "",
+                it.url or "",
+                it.nav_path or "",
+                it.tags or "",
+                it.usage_count or 0,
+                it.last_updated.isoformat() if it.last_updated else ""
+            ])
+        buf.seek(0)
+        yield buf.read()
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="knowledge_base.csv"'
+    }
+    return StreamingResponse(generate(), media_type="text/csv", headers=headers)
+
+
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_page():
     return HTMLResponse("""<!doctype html>
@@ -1443,6 +1611,10 @@ async def admin():
   <h3>Unknown Questions</h3>
   <div id="unknowns"></div>
 </div>
+<div class="card">
+  <h3>Export</h3>
+  <button onclick="downloadKB()">Download KB (CSV)</button>
+</div>
 
 <div class="card">
   <h3>Stats</h3>
@@ -1487,6 +1659,13 @@ async function scrape(){
   }catch(e){ out.textContent = 'Network error: ' + String(e); }
   loadStats();
 }
+
+
+async function downloadKB(){
+  // Simple navigation to trigger browser download
+  window.location.href = '/api/knowledge/export_csv';
+}
+
 
 async function resolveUnknown(id){
   const ans = prompt('Provide the answer for this question:'); if(!ans) return;
@@ -1534,11 +1713,11 @@ async def api_chat(payload: Dict[str, Any]):
     if confidence >= Config.CONFIDENCE_THRESHOLD:
         return {"ok": True, "reply": answer, "confidence": confidence, "source": "kb"}
 
-    # Engine (may return search_link/rules/llm)
+    # Engine (may return search_link/rules/llm/AI_UNAVAILABLE_MSG)
     reply = await ai_engine.generate_response(message, context=context)
     source = ai_engine.last_source or "rules"
 
-    if reply != AI_UNAVAILABLE_MSG:
+    if should_record_unknown(message, reply, source, confidence):
         uq = UnknownQuestion(
             id=f"unknown_{uuid4().hex}",
             question=message, call_id="chat", timestamp=now_utc(),
@@ -1788,8 +1967,9 @@ async def voice_websocket(websocket: WebSocket):
                         # LLM/rules
                         response_text = await ai_engine.generate_response(text)
             
-                        # Save unknown only if we produced a real answer
-                        if response_text != AI_UNAVAILABLE_MSG:
+                        # Save unknown only if gating passes
+                        src = ai_engine.last_source or "rules"
+                        if should_record_unknown(text, response_text, src, confidence):
                             uq = UnknownQuestion(
                                 id=f"unknown_{uuid4().hex}",
                                 question=text,
@@ -1797,10 +1977,9 @@ async def voice_websocket(websocket: WebSocket):
                                 timestamp=now_utc(),
                                 suggested_answer=response_text
                             )
-                            await db_manager.save_unknown_question(uq)
-            
-                    call.transcript += f"Agent: {response_text}\n"
-                    call.confidence_score = confidence
+                            await db_manager.save_unknown_question(uq)            
+                        call.transcript += f"Agent: {response_text}\n"
+                        call.confidence_score = confidence
             
                     # TTS
                     audio_bytes = await ai_engine.text_to_speech(response_text)
@@ -1859,11 +2038,18 @@ async def voice_websocket(websocket: WebSocket):
                     await websocket.send_json({"type": "closing", "reason": "transfer"})
                     await websocket.close(code=1000); call.outcome = "transferred"; break
                 response_text = await ai_engine.generate_response(text)
-                if response_text != AI_UNAVAILABLE_MSG:
-                    uq = UnknownQuestion(id=f"unknown_{uuid4().hex}", question=text, call_id=call_id,
-                                         timestamp=now_utc(), suggested_answer=response_text)
-                    await db_manager.save_unknown_question(uq)
-            call.transcript += f"Agent: {response_text}\n"; call.confidence_score = confidence
+                src = ai_engine.last_source or "rules"
+                if should_record_unknown(text, response_text, src, confidence):
+                    uq = UnknownQuestion(
+                        id=f"unknown_{uuid4().hex}",
+                        question=text,
+                        call_id=call_id,
+                        timestamp=now_utc(),
+                        suggested_answer=response_text
+                    )
+                    await db_manager.save_unknown_question(uq)            
+                    call.transcript += f"Agent: {response_text}\n"
+                    call.confidence_score = confidence
             audio_bytes = await ai_engine.text_to_speech(response_text)
             if confidence >= Config.CONFIDENCE_THRESHOLD:
                 source = "kb"
