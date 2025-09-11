@@ -1741,6 +1741,7 @@ async def admin():
 </div>
 
 <script>
+
 async function addKB(){
   const q = document.getElementById('q').value.trim();
   const a = document.getElementById('a').value.trim();
