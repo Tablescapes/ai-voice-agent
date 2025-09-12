@@ -1,2296 +1,2576 @@
-#!/usr/bin/env python3 
+#!/usr/bin/env python3
 """
-AI Voice Agent – Comprehensive Edition
-- Everything from Final Production + Full UI, plus:
-  * Catalog intent → search links to your public site
-  * Rental common-knowledge guides (dance floor, etc.)
-  * Synonym/alias expansion for KB matching
-  * CSV importer supports optional url/nav_path/tags columns
-  * Safe DB migrations for new columns
-  * More accurate "source" reporting (kb/rules/llm/search_link)
+Complete AI Voice Agent System - Production Ready & Fully Functional
+Single file implementation with all components working out of the box.
+
+Run: python main.py
+Then open: http://localhost:8000
+
+Requirements:
+pip install fastapi uvicorn websockets aiosqlite pydantic httpx gtts openai sentence-transformers numpy
 """
 
-from __future__ import annotations
-
-import os, re, csv, io, json, time, base64, asyncio, logging, tempfile, subprocess, threading
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime, timedelta, timezone
+import asyncio
+import logging
+import os
+import json
+import time
+import base64
+import tempfile
+import hashlib
+import re
+import sqlite3
+import io
+import subprocess
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Tuple, Union, AsyncGenerator
 from pathlib import Path
 from uuid import uuid4
-from collections import defaultdict
 from contextlib import asynccontextmanager
+from enum import Enum
+from dataclasses import dataclass
+import threading
+from collections import defaultdict, deque
+import traceback
 
-import aiosqlite
-import httpx
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
+# Core dependencies
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from starlette.concurrency import run_in_threadpool
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from fastapi.responses import StreamingResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel, Field, validator
+import uvicorn
+import httpx
+import aiosqlite
 
-from openai import OpenAI
-from gtts import gTTS
-from difflib import SequenceMatcher
-from urllib.parse import quote_plus, urlparse, urljoin
+# Optional AI dependencies with fallbacks
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
 
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)5s | %(name)s | %(message)s")
-logger = logging.getLogger("voice_agent")
-ASSISTANT_NAME = os.getenv("ASSISTANT_NAME", "Tablescapes Assistant")
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
 
-AI_UNAVAILABLE_MSG = "Sorry—our AI is temporarily unavailable. I can transfer you to a person or try again in a moment."
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    EMBEDDINGS_AVAILABLE = False
 
-# ------------------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------------------
-class Config:
-    # OpenAI
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1")
-    OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-    OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-    # Public site for search links
-    WEBSITE_BASE_URL = os.getenv("WEBSITE_BASE_URL", "https://www.tablescapes.com")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-    # CORS
-    CORS_ORIGINS = [o.strip() for o in os.getenv(
-        "CORS_ORIGINS",
-        "https://ai-voice-agent-uz9g.onrender.com,http://localhost:3000,http://localhost:8080"
-    ).split(",") if o.strip()]
+# ==============================================================================
+# Configuration
+# ==============================================================================
 
-    # App
-    BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
-    DATABASE_PATH = os.getenv("DATABASE_PATH", "voice_agent.db")
-    
-
-
-  
-
-    # Audio
-    SAMPLE_RATE = 16000
-    STT_TARGET_RATE = 16000
-    AUDIO_TTS_MIME = "audio/mpeg"  # gTTS -> MP3
-    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "5242880"))            # 5 MB/frame
-    MAX_COMBINED_AUDIO = int(os.getenv("MAX_COMBINED_AUDIO", "15728640"))   # 15 MB/batch
-    AUDIO_BUFFER_SIZE = int(os.getenv("AUDIO_BUFFER_SIZE", "4"))            # frames per STT batch
-
-    # KB / matching
-    SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.25"))
-    CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.50"))
-
-    # Call control
-    MAX_CALL_DURATION = int(os.getenv("MAX_CALL_DURATION", "600"))     # seconds
-    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "10"))      # seconds
-
-    # Server
-    HOST = os.getenv("HOST", "0.0.0.0")
+class Settings:
+    # Application
+    DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+    HOST = os.getenv("HOST", "0.0.0.0") 
     PORT = int(os.getenv("PORT", "8000"))
+    
+    # Security
+    SECRET_KEY = os.getenv("SECRET_KEY", "voice-agent-secret-key-change-in-production-32chars")
+    CORS_ORIGINS = ["*"] if os.getenv("CORS_ORIGINS", "*") == "*" else os.getenv("CORS_ORIGINS", "").split(",")
+    
+    # Database
+    DATABASE_PATH = os.getenv("DATABASE_PATH", "./voice_agent.db")
+    
+    # AI
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+    OPENAI_WHISPER_MODEL = os.getenv("OPENAI_WHISPER_MODEL", "whisper-1")
+    
+    # Audio
+    MAX_AUDIO_SIZE = int(os.getenv("MAX_AUDIO_SIZE", "10485760"))  # 10MB
+    AUDIO_SAMPLE_RATE = int(os.getenv("AUDIO_SAMPLE_RATE", "16000"))
+    
+    # WebSocket
+    MAX_CONNECTIONS = int(os.getenv("MAX_CONNECTIONS", "50"))
+    WEBSOCKET_TIMEOUT = int(os.getenv("WEBSOCKET_TIMEOUT", "300"))
+    
+    # Rate limiting
+    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+    RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "3600"))
+    
+    # Knowledge base
+    SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.75"))
+    
+    # Cache
+    CACHE_TTL = int(os.getenv("CACHE_TTL", "3600"))  # 1 hour
 
-    # Rate limiting / connections
-    MAX_CONCURRENT_CONNECTIONS = int(os.getenv("MAX_CONCURRENT_CONNECTIONS", "10"))
-    RATE_LIMIT_CONNECTIONS = int(os.getenv("RATE_LIMIT_CONNECTIONS", "3"))
-    RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "300"))
+settings = Settings()
 
-    # Circuit breaker
-    CB_FAIL_THRESHOLD = int(os.getenv("CB_FAIL_THRESHOLD", "3"))
-    CB_RESET_TIMEOUT = int(os.getenv("CB_RESET_TIMEOUT", "30"))
-    CB_HALF_OPEN_LIMIT = int(os.getenv("CB_HALF_OPEN_LIMIT", "2"))
+# ==============================================================================
+# Data Models
+# ==============================================================================
 
-    # Scraper
-    ALLOWED_SCRAPE_HOSTS = {h.strip().lower() for h in os.getenv(
-        "ALLOWED_SCRAPE_HOSTS", "tablescapes.com,www.tablescapes.com"
-    ).split(",") if h.strip()}
-    SCRAPE_MAX_PAGES = int(os.getenv("SCRAPE_MAX_PAGES", "300"))
-    SCRAPE_TIMEOUT = int(os.getenv("SCRAPE_TIMEOUT", "12"))
-    SCRAPE_CONCURRENCY = int(os.getenv("SCRAPE_CONCURRENCY", "6"))
+class MessageRole(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
 
-    # Misc
-    MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "4000"))
+class CallStatus(str, Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TRANSFERRED = "transferred"
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+class ChatMessage(BaseModel):
+    role: MessageRole
+    content: str = Field(..., min_length=1, max_length=4000)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
-def today_utc_range() -> Tuple[str, str]:
-    start = datetime.now(timezone.utc).date()
-    end = start + timedelta(days=1)
-    return start.isoformat(), end.isoformat()
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+    session_id: Optional[str] = None
+    
+    @validator('message')
+    def validate_message(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError('Message cannot be empty')
+        # Basic XSS prevention
+        suspicious = ['<script', 'javascript:', 'data:', 'vbscript:', 'onload=']
+        if any(pattern in v.lower() for pattern in suspicious):
+            raise ValueError('Invalid characters in message')
+        return v
 
-def limit_len(s: str, maxlen: int) -> str:
-    return s if len(s) <= maxlen else s[:maxlen]
-
-def ffmpeg_available() -> bool:
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-        return True
-    except Exception:
-        return False
-
-def catalog_search_url(q: str) -> str:
-    base = (Config.WEBSITE_BASE_URL or "").strip().rstrip("/")
-    if not base:
-        return ""
-    return f"{base}/?s={quote_plus(q)}&post_type=product"
-
-
-# Aliases to normalize jargon → improve KB matching
-ALIASES = {
-    # common synonyms → canonicals
-    "silverware": "flatware",
-    "cutlery": "flatware",
-    "goblet": "glasses",
-    "goblets": "glasses",
-    "stemware": "glasses",
-    "linen": "linens",
-    "napkin": "linens",
-    "napkins": "linens",
-    "tablecloth": "linens",
-    "runner": "linens",
-    "sofa": "lounge",
-    "couch": "lounge",
-    "back bar": "backbar",
-    "back-bar": "backbar",
-    "dancefloor": "dance floor",
-
-    # chargers & canon plurality
-    "charger": "charger plates",
-    "chargers": "charger plates",
-
-    # barstools canon (do NOT collapse to stools)
-    "bar stool": "barstools",
-    "bar stools": "barstools",
-    "barstool": "barstools",
-
-    # keep generic stools
-    "stool": "stools",
-
-    # single → plural where helpful
-    "chair": "chairs",
-    "stanchion": "stanchions",
-    "rope": "ropes",
-    "candelabra": "candelabras",
-
-    # user phrasings
-    "stanchions and ropes": "stanchions ropes",
-    "stanchions & ropes": "stanchions ropes",
-    "rope stanchions": "stanchions ropes",
-    "lounge furniture": "lounge",
-    "seating": "chairs",
-}
-
-
-
-# Reverse map to recover common variants for a canonical term (for matching bonus)
-REV_ALIASES: Dict[str, List[str]] = {}
-for k, v in ALIASES.items():
-    REV_ALIASES.setdefault(v, []).append(k)
-
-CONTRACTIONS = {
-    "what's": "what is", "who's": "who is", "where's": "where is",
-    "i'm": "i am", "you're": "you are", "it's": "it is",
-    "we're": "we are", "they're": "they are", "can't": "cannot",
-    "won't": "will not", "don't": "do not", "doesn't": "does not"
-}
-
-PRODUCT_TYPES = {"chairs","chair","chargers","charger","barstools","barstool","stools","stool","lounge","rattan","linens","glass","glasses","flatware","china"}
-
-def normalize_text(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = s.replace("’","'").replace("“", '"').replace("”", '"')
-    for k, v in CONTRACTIONS.items():
-        s = s.replace(k, v)
-    s = re.sub(r"\bwhats\b", "what is", s)
-
-    # NEW: "X in Y" → "Y X" when X looks like a product type
-    s = re.sub(
-        rf"\b({'|'.join(sorted(PRODUCT_TYPES))})\s+in\s+([a-z][a-z\s]{{1,20}})\b",
-        r"\2 \1",
-        s
-    )
-
-    # existing alias pass
-    for k, v in ALIASES.items():
-        s = re.sub(rf"\b{k}\b", v, s)
-
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def jaccard_tokens(a: str, b: str) -> float:
-    ta, tb = set(a.split()), set(b.split())
-    if not ta and not tb: return 1.0
-    if not ta or not tb:  return 0.0
-    return len(ta & tb) / len(ta | tb)
-
-
-def cosine_sim(a: List[float] | None, b: List[float] | None) -> float:
-    if not a or not b: 
-        return 0.0
-    s = sum(x*y for x, y in zip(a, b))
-    na = sum(x*x for x in a) ** 0.5
-    nb = sum(y*y for y in b) ** 0.5
-    if na == 0.0 or nb == 0.0:
-        return 0.0
-    return s / (na * nb)
-
-def _enrich_tokens_with_aliases(tokens: set[str]) -> set[str]:
-    """Add common variants for any canonical token based on REV_ALIASES (without removing canonicals)."""
-    out = set(tokens)
-    for t in list(tokens):
-        # if t is canonical, add its known variants
-        if t in REV_ALIASES:
-            out.update(REV_ALIASES[t])
-    return out
-
-STOPWORDS = {
-    "do","you","have","show","me","in","the","a","an","to","of","for",
-    "on","at","and","or","please","can","could","would","is","are"
-}
-
-
-def _tokens_for_matching(*parts: str) -> set[str]:
-    """Normalize each part, split to tokens, drop stopwords, then enrich with alias variants."""
-    tokens: set[str] = set()
-    for p in parts:
-        if not p:
-            continue
-        norm = normalize_text(p)
-        if not norm:
-            continue
-        # NEW: drop stopwords here
-        tokens.update(t for t in norm.split() if t not in STOPWORDS)
-    return _enrich_tokens_with_aliases(tokens)
-
-
-
-# -------------------------
-# Small-talk / unknown gating
-# -------------------------
-_SMALL_TALK_PATTERNS = [
-    "are you there", "you there", "can you hear me", "hello", "hi", "hey",
-    "good morning", "good afternoon", "good evening",
-    "what's your name", "whats your name", "what is your name", "who are you", "your name",
-    "what can you do", "what do you do", "capabilities",
-    "thanks", "thank you", "thx", "appreciate it",
-    "bye", "goodbye", "see ya", "see you"
-]
-
-def is_small_talk(text: str) -> bool:
-    if not text: 
-        return False
-    t = (text or "").lower().strip()
-    return any(p in t for p in _SMALL_TALK_PATTERNS)
-
-def is_rental_guide_reply(reply_text: str) -> bool:
-    # Heuristic: our dance-floor helper formats bullets and a "Browse options:" tail.
-    if not reply_text:
-        return False
-    r = reply_text.lower()
-    return ("dance floor" in r) and ("browse options:" in r)
-
-def should_record_unknown(user_text: str, reply_text: str, source: str, confidence: float) -> bool:
-    # Only record when: not in KB, below confidence threshold, not small-talk, not catalog link/guide, not AI-unavailable.
-    if not reply_text:
-        return False
-    if reply_text == AI_UNAVAILABLE_MSG:
-        return False
-    if confidence >= Config.CONFIDENCE_THRESHOLD:
-        return False
-    if is_small_talk(user_text) or is_small_talk(reply_text):
-        return False
-    if (source or "").lower() == "search_link":
-        return False
-    if is_rental_guide_reply(reply_text):
-        return False
-    return True
-
-
-# ------------------------------------------------------------------------------
-# Data models
-# ------------------------------------------------------------------------------
-@dataclass
-class Call:
-    call_id: str
-    caller_info: str
-    start_time: datetime
-    end_time: Optional[datetime] = None
-    transcript: str = ""
-    outcome: str = ""
-    confidence_score: float = 0.0
-    audio_file: Optional[str] = None
-
-@dataclass
-class KnowledgeItem:
-    id: str
-    question: str
-    answer: str
+class ChatResponse(BaseModel):
+    message: str
+    confidence: float = Field(ge=0.0, le=1.0)
     source: str
-    embedding: Optional[List[float]] = None
-    last_updated: Optional[datetime] = None
+    session_id: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class KnowledgeItem(BaseModel):
+    id: Optional[str] = None
+    question: str = Field(..., min_length=1, max_length=2000)
+    answer: str = Field(..., min_length=1, max_length=5000)
+    category: Optional[str] = None
+    source: Optional[str] = None
     usage_count: int = 0
-    # NEW optional metadata
-    url: Optional[str] = None
-    nav_path: Optional[str] = None
-    tags: Optional[str] = None
+    confidence_threshold: float = Field(0.75, ge=0.0, le=1.0)
+    active: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
-@dataclass
-class UnknownQuestion:
-    id: str
-    question: str
+class UnknownQuestion(BaseModel):
+    id: Optional[str] = None
     call_id: str
-    timestamp: datetime
-    resolved: bool = False
+    question: str
     suggested_answer: Optional[str] = None
+    resolved: bool = False
+    created_at: Optional[datetime] = None
 
-# ------------------------------------------------------------------------------
-# Connection tracking + rate limiting
-# ------------------------------------------------------------------------------
-class ConnectionTracker:
-    def __init__(self, max_connections: int = 10):
-        self.max_connections = max_connections
-        self.active = set()
-        self.lock = threading.Lock()
-    def add(self, conn_id: str) -> bool:
-        with self.lock:
-            if len(self.active) >= self.max_connections:
+class BaseResponse(BaseModel):
+    success: bool
+    message: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+# ==============================================================================
+# Utilities
+# ==============================================================================
+
+class TTLCache:
+    """Simple TTL cache implementation."""
+    
+    def __init__(self, maxsize: int = 1000, ttl: int = 3600):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._cache: Dict[str, Tuple[Any, float]] = {}
+        self._lock = threading.RLock()
+    
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key not in self._cache:
+                return None
+            
+            value, expire_time = self._cache[key]
+            if time.time() > expire_time:
+                del self._cache[key]
+                return None
+            
+            return value
+    
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            if len(self._cache) >= self.maxsize:
+                self._cleanup()
+            
+            expire_time = time.time() + self.ttl
+            self._cache[key] = (value, expire_time)
+    
+    def _cleanup(self):
+        current_time = time.time()
+        expired = [k for k, (_, exp) in self._cache.items() if current_time > exp]
+        for k in expired:
+            del self._cache[k]
+        
+        # Remove oldest if still too many
+        if len(self._cache) >= self.maxsize:
+            sorted_items = sorted(self._cache.items(), key=lambda x: x[1][1])
+            for k, _ in sorted_items[:len(sorted_items)//4]:
+                del self._cache[k]
+
+class CircuitBreaker:
+    """Circuit breaker for handling failures."""
+    
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: int = 60):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "closed"  # closed, open, half_open
+        self._lock = threading.Lock()
+    
+    def can_execute(self) -> bool:
+        with self._lock:
+            if self.state == "closed":
+                return True
+            
+            if self.state == "open":
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = "half_open"
+                    return True
                 return False
-            self.active.add(conn_id); return True
-    def remove(self, conn_id: str):
-        with self.lock: self.active.discard(conn_id)
-    def count(self) -> int:
-        with self.lock: return len(self.active)
-connection_tracker = ConnectionTracker(Config.MAX_CONCURRENT_CONNECTIONS)
+            
+            return True  # half_open
+    
+    def record_success(self):
+        with self._lock:
+            self.failure_count = 0
+            self.state = "closed"
+    
+    def record_failure(self):
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold:
+                self.state = "open"
+
+class ConnectionManager:
+    """Manage WebSocket connections."""
+    
+    def __init__(self, max_connections: int = 50):
+        self.max_connections = max_connections
+        self.active_connections: Dict[str, WebSocket] = {}
+        self._lock = threading.Lock()
+    
+    def can_connect(self) -> bool:
+        with self._lock:
+            return len(self.active_connections) < self.max_connections
+    
+    def connect(self, session_id: str, websocket: WebSocket) -> bool:
+        with self._lock:
+            if not self.can_connect():
+                return False
+            self.active_connections[session_id] = websocket
+            return True
+    
+    def disconnect(self, session_id: str):
+        with self._lock:
+            self.active_connections.pop(session_id, None)
+    
+    def get_connection_count(self) -> int:
+        with self._lock:
+            return len(self.active_connections)
 
 class RateLimiter:
-    def __init__(self, max_connections: int = 3, window_seconds: int = 300, max_clients: int = 1000):
-        self.max_connections = max_connections
-        self.window = window_seconds
-        self.max_clients = max_clients
-        self.connections = defaultdict(list)
-        self.lock = threading.Lock()
-        self.last_cleanup = time.monotonic()
-        self.cleanup_interval = 300
+    """Simple rate limiter."""
+    
+    def __init__(self, max_requests: int = 100, window: int = 3600):
+        self.max_requests = max_requests
+        self.window = window
+        self.requests: Dict[str, List[float]] = defaultdict(list)
+        self._lock = threading.Lock()
+    
     def is_allowed(self, client_id: str) -> bool:
-        now = time.monotonic()
-        with self.lock:
-            if now - self.last_cleanup > self.cleanup_interval:
-                self._cleanup(now); self.last_cleanup = now
-            win_start = now - self.window
-            lst = [t for t in self.connections[client_id] if t > win_start]
-            self.connections[client_id] = lst
-            if len(lst) < self.max_connections:
-                lst.append(now); return True
-            return False
-    def _cleanup(self, now: float):
-        cutoff = now - self.window * 2
-        to_del = [cid for cid, ts in self.connections.items() if not ts or ts[-1] < cutoff]
-        for cid in to_del: del self.connections[cid]
-        if len(self.connections) > self.max_clients:
-            items = sorted(self.connections.items(), key=lambda kv: kv[1][-1] if kv[1] else 0)
-            for cid, _ in items[:len(self.connections) - self.max_clients]:
-                del self.connections[cid]
-    def stats(self) -> Dict[str, Any]:
-        with self.lock:
-            return {
-                "active_clients": len(self.connections),
-                "total_marks": sum(len(v) for v in self.connections.values()),
-                "window_seconds": self.window,
-                "max_connections_per_window": self.max_connections
-            }
-rate_limiter = RateLimiter(Config.RATE_LIMIT_CONNECTIONS, Config.RATE_LIMIT_WINDOW)
-
-# ------------------------------------------------------------------------------
-# Circuit Breaker
-# ------------------------------------------------------------------------------
-class CircuitBreaker:
-    def __init__(self, fail_threshold: int = 3, reset_timeout: int = 30, half_open_limit: int = 2):
-        self.fail_threshold = fail_threshold
-        self.reset_timeout = reset_timeout
-        self.half_open_limit = half_open_limit
-        self.state = "closed"
-        self.failure_count = 0
-        self.success_count = 0
-        self.opened_at: Optional[float] = None
-        self.half_open_calls = 0
-        self.lock = threading.Lock()
-    def can_call(self) -> bool:
-        with self.lock:
-            if self.state == "closed": return True
-            if self.state == "open":
-                if self.opened_at and time.monotonic() - self.opened_at >= self.reset_timeout:
-                    self.state = "half-open"; self.half_open_calls = 0; self.success_count = 0
-                    logger.info("Circuit -> half-open"); return True
+        with self._lock:
+            now = time.time()
+            # Clean old requests
+            self.requests[client_id] = [
+                req_time for req_time in self.requests[client_id]
+                if now - req_time < self.window
+            ]
+            
+            if len(self.requests[client_id]) >= self.max_requests:
                 return False
-            if self.state == "half-open":
-                if self.half_open_calls < self.half_open_limit:
-                    self.half_open_calls += 1; return True
-                return False
-            return False
-    def record_success(self):
-        with self.lock:
-            if self.state == "half-open":
-                self.success_count += 1
-                if self.success_count >= 2:
-                    self.state = "closed"; self.failure_count = 0
-                    self.opened_at = None; self.half_open_calls = 0; self.success_count = 0
-                    logger.info("Circuit -> closed (recovered)")
-            elif self.state == "closed":
-                self.failure_count = max(0, self.failure_count - 1)
-    def record_failure(self):
-        with self.lock:
-            if self.state == "half-open":
-                self.state = "open"; self.opened_at = time.monotonic()
-                self.half_open_calls = 0; self.success_count = 0
-                logger.warning("Circuit half-open call failed -> open")
-            else:
-                self.failure_count += 1
-                if self.failure_count >= self.fail_threshold:
-                    self.state = "open"; self.opened_at = time.monotonic()
-                    logger.warning("Circuit opened")
-    def status(self) -> Dict[str, Any]:
-        with self.lock:
-            return {"state": self.state, "failure_count": self.failure_count,
-                    "success_count": self.success_count, "half_open_calls": self.half_open_calls}
-
-# ------------------------------------------------------------------------------
-# AI Engine
-# ------------------------------------------------------------------------------
-class LightweightAIEngine:
-    def __init__(self):
-        self.openai_client: Optional[OpenAI] = None
-        if Config.OPENAI_API_KEY:
-            self.openai_client = OpenAI(api_key=Config.OPENAI_API_KEY, timeout=30.0, max_retries=0)
-            logger.info("OpenAI client initialized.")
-        else:
-            logger.info("No OPENAI_API_KEY set. Falling back to rule-based responses.")
-        self.cb_stt = CircuitBreaker(Config.CB_FAIL_THRESHOLD, Config.CB_RESET_TIMEOUT, Config.CB_HALF_OPEN_LIMIT)
-        self.cb_chat = CircuitBreaker(Config.CB_FAIL_THRESHOLD, Config.CB_RESET_TIMEOUT, Config.CB_HALF_OPEN_LIMIT)
-        self.last_source = "rules"
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10),
-           retry=retry_if_exception_type(Exception), reraise=True)
-    def _sync_openai_stt(self, file_obj, model: str):
-        return self.openai_client.audio.transcriptions.create(model=model, file=file_obj)
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10),
-           retry=retry_if_exception_type(Exception), reraise=True)
-    def _sync_openai_chat(self, messages, model, temperature, max_tokens):
-        return self.openai_client.chat.completions.create(
-            model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
-        )
-
-    async def convert_audio_to(self, data: bytes, target_sample_rate: int = 16000) -> Tuple[bytes, str]:
-        if len(data) > Config.MAX_COMBINED_AUDIO:
-            raise ValueError("audio_combination_too_large")
-        def _run():
-            with tempfile.TemporaryDirectory() as td:
-                in_path = Path(td) / "in.webm"
-                out_path = Path(td) / "out.wav"
-                try:
-                    in_path.write_bytes(data)
-                    subprocess.run(
-                        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                         "-i", str(in_path), "-ar", str(target_sample_rate), "-ac", "1",
-                         "-f", "wav", str(out_path), "-y"],
-                        check=True, timeout=30
-                    )
-                    return out_path.read_bytes(), "wav"
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                    return data, "webm"
-        return await run_in_threadpool(_run)
-
-    async def speech_to_text(self, audio_bytes: bytes) -> str:
-        """Batch STT with circuit breaker and retries."""
-        if not self.openai_client:
-            return ""
-        if not self.cb_stt.can_call():
-            return ""
-        if len(audio_bytes) > Config.MAX_COMBINED_AUDIO:
-            return ""
-
-        try:
-            wav_bytes, fmt = await self.convert_audio_to(audio_bytes, Config.STT_TARGET_RATE)
-        except ValueError:
-            return ""
-        suffix = ".wav" if fmt == "wav" else ".webm"
-
-        def _transcribe_sync(path: Path, model: str) -> str:
-            with path.open("rb") as f:
-                resp = self._sync_openai_stt(f, model)
-                return (getattr(resp, "text", "") or "").strip()
-
-        async def _transcribe():
-            with tempfile.TemporaryDirectory() as td:
-                p = Path(td) / f"audio{suffix}"
-                p.write_bytes(wav_bytes)
-                try:
-                    text = await run_in_threadpool(_transcribe_sync, p, Config.OPENAI_STT_MODEL)
-                    self.cb_stt.record_success()
-                    return text
-                except Exception:
-                    self.cb_stt.record_failure()
-                    return ""
-
-        return await _transcribe()
-
-    def _tts_sync(self, text: str) -> bytes:
-        with tempfile.TemporaryDirectory() as td:
-            out = Path(td) / "tts.mp3"
-            gTTS(text=text, lang="en", slow=False).save(str(out))
-            return out.read_bytes()
-
-    async def text_to_speech(self, text: str) -> bytes:
-        text = limit_len(text, Config.MAX_INPUT_LEN)
-        try:
-            return await asyncio.wait_for(run_in_threadpool(self._tts_sync, text), timeout=30.0)
-        except Exception:
-            return b""
-
-    # -------- Catalog intent + rental guides --------
-    def _catalog_intent(self, u: str) -> bool:
-        toks = [t for t in re.findall(r"[a-z0-9]+", u.lower()) if t]
-        if not toks: return False
-        if len(toks) <= 7 and not u.strip().endswith("?"):
-            product_words = {
-                "charger","chargers","plate","plates","goblet","glass","glasses","stemware",
-                "flatware","silverware","fork","knife","spoon","linen","linens","napkin","runner","tablecloth",
-                "chair","chairs","stool","barstool","sofa","couch","lounge","rattan","wicker",
-                "table","tables","farm","round","banquet","stage","tent","bar","backbar",
-                "dance","floor","backdrop","arch","umbrella","heater","patio","wedding","aisle","blue","gold","white",
-                "velvet","sequin","china","plate","saucer","cup","bowl","tumbler","decanter"
-            }
-            return any(w in product_words for w in toks)
-        return False
-
-    def _dance_floor_guide(self, query: str) -> Optional[str]:
-        ul = query.lower()
-        if ("dance" in ul and "floor" in ul) and any(k in ul for k in ["size", "sizes", "dimension", "dimensions"]):
-            guide = (
-                "Typical dance floor footprints (3′×3′ panels):\n"
-                "• 12′×12′ → up to ~40 dancers\n"
-                "• 15′×15′ → up to ~65 dancers\n"
-                "• 18′×18′ → up to ~90 dancers\n"
-                "• 21′×21′ → up to ~125 dancers\n"
-                "• 24′×24′ → up to ~165 dancers\n"
-                f"Browse options: {catalog_search_url('dance floor')}"
-            )
-            return guide
-        return None
-
-    async def generate_response(self, user_input: str, context: str = "") -> str:
-        user_input = limit_len(user_input, Config.MAX_INPUT_LEN)
-        u = (user_input or "").strip()
-        ul = u.lower()
-        llm_unavailable = False
-
-        # Catalog: short noun-phrases → direct search link
-        if self._catalog_intent(u):
-            self.last_source = "search_link"
-            return f"Here are items matching “{u}”: {catalog_search_url(u)}"
-
-        # Rental guide: dance floor sizes
-        guide = self._dance_floor_guide(u)
-        if guide:
-            self.last_source = "rules"; return guide
-
-        # Try LLM
-        # Try LLM
-        if self.openai_client and self.cb_chat.can_call():
-            try:
-                resp = await run_in_threadpool(
-                    self._sync_openai_chat,
-                    [
-                        {"role": "system",
-                         "content": ("You are a concise, accurate customer service agent for a tableware & event-rental company. "
-                                     "Include links only when certain. "
-                                     f"Context:\n{context}")},
-                        {"role": "user", "content": u}
-                    ],
-                    Config.OPENAI_CHAT_MODEL, 0.2, 220
-                )
-                text = (resp.choices[0].message.content or "").strip()
-                self.cb_chat.record_success()
-                if text:
-                    self.last_source = "llm"; return text
-            except Exception as e:
-                self.cb_chat.record_failure()
-                llm_unavailable = True
-                logger.error("Chat error: %r", e)
-        else:
-            # No client or breaker is open
-            llm_unavailable = True
-        # Rules fallback (small talk etc.)
-        if not ul:
-            self.last_source = "rules"; return "Could you repeat that?"
-        if any(p in ul for p in ["are you there", "you there", "can you hear me", "hello?", "hi?"]):
-            self.last_source = "rules"; return "I'm here and listening."
-        if any(p in ul for p in ["hello","hi","hey","good morning","good afternoon","good evening"]):
-            self.last_source = "rules"; return f"Hi—I'm {ASSISTANT_NAME}. How can I help?"
-        if any(p in ul for p in ["what's your name","whats your name","what is your name","who are you","your name"]):
-            self.last_source = "rules"; return f"I'm {ASSISTANT_NAME}."
-        if any(p in ul for p in ["what can you do","what do you do","capabilities"]):
-            self.last_source = "rules"; return ("I can answer questions about inventory, pricing, delivery, policies, and event-rental basics. "
-                                                "Tell me the item or topic.")
-        if any(p in ul for p in ["thanks","thank you","thx","appreciate it"]):
-            self.last_source = "rules"; return "You’re welcome!"
-        if any(p in ul for p in ["bye","goodbye","see ya","see you"]):
-            self.last_source = "rules"; return "Thanks for visiting—talk soon."
-        # If we land here, no rule matched. If LLM is unavailable, surface it explicitly.
-        if llm_unavailable:
-            self.last_source = "llm_unavailable"
-            return AI_UNAVAILABLE_MSG
-        # Otherwise, keep the generic rules fallback.
-        self.last_source = "rules"
-        return "I can help with that. Could you clarify the item or topic?"
-
-    # Lightweight "embedding"
-    def get_embedding(self, text: str) -> List[float]:
-        # Prefer real embeddings; fall back to lightweight, deterministic features.
-        txt = limit_len(text or "", 2000)
-    
-        if self.openai_client:
-            try:
-                resp = self.openai_client.embeddings.create(
-                    model=Config.OPENAI_EMBEDDING_MODEL,
-                    input=txt,
-                )
-                emb = resp.data[0].embedding
-                if isinstance(emb, list) and emb:
-                    return emb
-            except Exception as e:
-                logger.warning("Embedding API failed, using lightweight fallback: %r", e)
-    
-        # ---- Fallback: lightweight 10-dim feature vector ----
-        words_norm = normalize_text(txt).split()
-        # count punctuation from the *raw* text (normalize_text strips it)
-        punct_count = sum(1 for ch in (text or "") if ch in "?!.")
-    
-        features = [
-            float(len(words_norm)),  # token count
-            float(sum(len(w) for w in words_norm) / max(1, len(words_norm))),  # avg token len
-            float(any(any(c.isdigit() for c in w) for w in words_norm)),  # any digits
-            float(punct_count),  # punctuation signal
-        ]
-        while len(features) < 10:
-            features.append(0.0)
-        return features[:10]
-    
-        # Fallback: lightweight 10-dim features (keep simple & deterministic)
-        words_norm = normalize_text(txt).split()
-        # count punctuation from raw text (normalize_text strips it)
-        punct_count = sum(ch in "?!." for ch in (text or ""))
-    
-        features = [
-            float(len(words_norm)),
-            float(sum(len(w) for w in words_norm) / max(1, len(words_norm))),
-            float(any(c.isdigit() for w in words_norm for c in w)),
-            float(punct_count),
-        ]
-        while len(features) < 10:
-            features.append(0.0)
-        return features[:10]
-    
-        # Fallback: your existing lightweight 10-dim features
-        words = normalize_text(txt).split()
-        features = [
-            float(len(words)),
-            float(sum(len(w) for w in words) / max(1, len(words))),
-            float(sum(1 for w in words if any(c.isdigit() for c in w))),
-            float(sum(1 for w in words if ('?' in w or '!' in w))),
-        ]
-        while len(features) < 10: 
-            features.append(0.0)
-        return features[:10]
-
-
-    def breakers_status(self) -> Dict[str, Any]:
-        return {"stt": self.cb_stt.status(), "chat": self.cb_chat.status()}
-
-# ------------------------------------------------------------------------------
-# Database
-# ------------------------------------------------------------------------------
-class DatabaseManager:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-
-    async def init_database(self):
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("PRAGMA journal_mode=WAL;")
-            await conn.execute("PRAGMA busy_timeout=5000;")
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS calls (
-                    call_id TEXT PRIMARY KEY,
-                    caller_info TEXT,
-                    start_time TEXT,
-                    end_time TEXT,
-                    transcript TEXT,
-                    outcome TEXT,
-                    confidence_score REAL,
-                    audio_file TEXT
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS knowledge_base (
-                    id TEXT PRIMARY KEY,
-                    question TEXT,
-                    answer TEXT,
-                    source TEXT,
-                    embedding BLOB,
-                    last_updated TEXT,
-                    usage_count INTEGER DEFAULT 0,
-                    url TEXT,
-                    nav_path TEXT,
-                    tags TEXT
-                )
-            """)
-            # Safe migrations if table existed without new columns
-            for col in ("url", "nav_path", "tags"):
-                try:
-                    await conn.execute(f"ALTER TABLE knowledge_base ADD COLUMN {col} TEXT")
-                except Exception:
-                    pass
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS unknown_questions (
-                    id TEXT PRIMARY KEY,
-                    question TEXT,
-                    call_id TEXT,
-                    timestamp TEXT,
-                    resolved INTEGER DEFAULT 0,
-                    suggested_answer TEXT
-                )
-            """)
-            await conn.commit()
-
-    async def save_call(self, call: Call):
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("""
-                INSERT OR REPLACE INTO calls
-                (call_id, caller_info, start_time, end_time, transcript, outcome, confidence_score, audio_file)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                call.call_id, call.caller_info,
-                call.start_time.isoformat() if call.start_time else None,
-                call.end_time.isoformat() if call.end_time else None,
-                call.transcript, call.outcome, call.confidence_score, call.audio_file
-            ))
-            await conn.commit()
-
-    async def save_knowledge_item(self, item: KnowledgeItem):
-        import pickle
-        blob = pickle.dumps(item.embedding) if item.embedding else None
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("""
-                INSERT OR REPLACE INTO knowledge_base
-                (id, question, answer, source, embedding, last_updated, usage_count, url, nav_path, tags)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                item.id, item.question, item.answer, item.source,
-                blob,
-                item.last_updated.isoformat() if item.last_updated else None,
-                item.usage_count,
-                item.url, item.nav_path, item.tags
-            ))
-            await conn.commit()
-
-    async def save_unknown_question(self, uq: UnknownQuestion):
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("""
-                INSERT OR REPLACE INTO unknown_questions
-                (id, question, call_id, timestamp, resolved, suggested_answer)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                uq.id,
-                uq.question,
-                uq.call_id,
-                uq.timestamp.isoformat() if uq.timestamp else now_utc().isoformat(),
-                int(uq.resolved),
-                uq.suggested_answer
-            ))
-            await conn.commit()
-
-    async def increment_usage_count(self, item_id: str):
-        async with aiosqlite.connect(self.db_path) as conn:
-            await conn.execute("UPDATE knowledge_base SET usage_count = usage_count + 1 WHERE id = ?", (item_id,))
-            await conn.commit()
-
-    async def get_knowledge_base(self) -> List[KnowledgeItem]:
-        import pickle
-        async with aiosqlite.connect(self.db_path) as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.execute("SELECT * FROM knowledge_base") as cur:
-                rows = await cur.fetchall()
-        items: List[KnowledgeItem] = []
-        for r in rows:
-            emb = pickle.loads(r["embedding"]) if r["embedding"] else None
-            items.append(
-                KnowledgeItem(
-                    id=r["id"], question=r["question"], answer=r["answer"], source=r["source"],
-                    embedding=emb,
-                    last_updated=datetime.fromisoformat(r["last_updated"]) if r["last_updated"] else None,
-                    usage_count=r["usage_count"] or 0,
-                    url=r["url"], nav_path=r["nav_path"], tags=r["tags"]
-                )
-            )
-        return items
-
-    async def get_unknown_questions(self, resolved: bool = False) -> List[UnknownQuestion]:
-        async with aiosqlite.connect(self.db_path) as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.execute(
-                "SELECT * FROM unknown_questions WHERE resolved = ? ORDER BY timestamp DESC", (int(resolved),)
-            ) as cur:
-                rows = await cur.fetchall()
-        out: List[UnknownQuestion] = []
-        for r in rows:
-            out.append(
-                UnknownQuestion(
-                    id=r["id"], question=r["question"], call_id=r["call_id"],
-                    timestamp=datetime.fromisoformat(r["timestamp"]),
-                    resolved=bool(r["resolved"]), suggested_answer=r["suggested_answer"]
-                )
-            )
-        return out
-
-    async def get_call_statistics(self) -> Dict[str, Any]:
-        start_iso, end_iso = today_utc_range()
-        async with aiosqlite.connect(self.db_path) as conn:
-            conn.row_factory = aiosqlite.Row
-            async with conn.execute("""
-                SELECT COUNT(*) AS total_calls,
-                       AVG(confidence_score) AS avg_confidence,
-                       SUM(CASE WHEN outcome='answered' THEN 1 ELSE 0 END) AS answered_calls,
-                       SUM(CASE WHEN outcome='transferred' THEN 1 ELSE 0 END) AS transferred_calls
-                FROM calls
-                WHERE start_time >= ? AND start_time < ?
-            """, (start_iso, end_iso)) as cur:
-                row = await cur.fetchone()
-            async with conn.execute("""
-                SELECT COUNT(*) AS c FROM unknown_questions
-                WHERE timestamp >= ? AND timestamp < ? AND resolved = 0
-            """, (start_iso, end_iso)) as cur2:
-                row2 = await cur2.fetchone()
-        return {
-            "total_calls": row["total_calls"] or 0,
-            "avg_confidence": row["avg_confidence"] or 0.0,
-            "answered_calls": row["answered_calls"] or 0,
-            "transferred_calls": row["transferred_calls"] or 0,
-            "unknown_questions": row2["c"] or 0
-        }
-
-# ------------------------------------------------------------------------------
-# Knowledge Manager
-# ------------------------------------------------------------------------------
-class KnowledgeBaseManager:
-    def __init__(self, ai_engine: LightweightAIEngine, db_manager: DatabaseManager):
-        self.ai = ai_engine
-        self.db = db_manager
-        self.knowledge_items: List[KnowledgeItem] = []
-
-    async def load(self):
-        self.knowledge_items = await self.db.get_knowledge_base()
-        logger.info(f"Loaded {len(self.knowledge_items)} knowledge items.")
-
-    async def add_knowledge_item(self, question: str, answer: str, source: str = "manual",
-                                 url: Optional[str] = None, nav_path: Optional[str] = None,
-                                 tags: Optional[str] = None):
-        k_id = uuid4().hex
-        emb = self.ai.get_embedding(question)
-        item = KnowledgeItem(
-            id=k_id,
-            question=limit_len(question, Config.MAX_INPUT_LEN),
-            answer=limit_len(answer, Config.MAX_INPUT_LEN),
-            source=source, embedding=emb, last_updated=now_utc(),
-            url=url, nav_path=nav_path, tags=tags
-        )
-        self.knowledge_items.append(item)
-        await self.db.save_knowledge_item(item)
-
-    async def find_answer(self, question: str) -> Tuple[str, float, Optional[str]]:
-        """
-        KB lookup with alias-aware token matching + fuzzy + embedding cosine.
-        Returns (answer, confidence, kb_item_id_or_None).
-        """
-        if not self.knowledge_items:
-            return "", 0.0, None
-    
-        # Normalize / prepare query representations
-        q_norm = normalize_text(question)
-        q_tokens = _tokens_for_matching(question)
-    
-        # Detect product intent (short nouny queries)
-        product_intent = False
-        if hasattr(self.ai, "_catalog_intent"):
-            try:
-                product_intent = self.ai._catalog_intent(question)
-            except Exception:
-                product_intent = False
-    
-        # One-time query embedding
-        try:
-            q_emb = self.ai.get_embedding(question)
-        except Exception:
-            q_emb = None
-    
-        best_ans, best_sim, best_id = "", 0.0, None
-    
-        for it in self.knowledge_items:
-            # Compose item text for matching (include tags & nav path)
-            item_text = it.question
-            if it.tags:
-                item_text += " " + it.tags
-            if it.nav_path:
-                item_text += " " + it.nav_path.replace("→", " ").replace("/", " ")
-    
-            it_norm = normalize_text(item_text)
-            it_tokens = _tokens_for_matching(item_text)
-    
-            # Token Jaccard
-            j = (len(q_tokens & it_tokens) / len(q_tokens | it_tokens)) if (q_tokens and it_tokens) else 0.0
-    
-            # Character-level fuzzy
-            s = SequenceMatcher(None, q_norm, it_norm).ratio()
-    
-            # Embedding cosine
-            embed_sim = cosine_sim(q_emb, it.embedding) if it.embedding else 0.0
-    
-            # Combine: strongest of the three signals
-            sim = max(j, s * 0.90, embed_sim * 0.90)
-    
-            # Tag overlap bonus (bounded)
-            if it.tags:
-                tag_tokens = _tokens_for_matching(it.tags)
-                if tag_tokens:
-                    overlap = len(q_tokens & tag_tokens)
-                    denom = max(1, len(tag_tokens))
-                    sim += min(0.12, 0.12 * (overlap / denom))
-    
-            # Product intent + URL present = small bump
-            if product_intent and it.url:
-                sim += 0.05
-    
-            if sim > 1.0:
-                sim = 1.0
-    
-            if sim > best_sim and sim >= Config.SIMILARITY_THRESHOLD:
-                meta_tail = []
-                if it.nav_path: meta_tail.append(f"Menu path: {it.nav_path}")
-                if it.url: meta_tail.append(f"Link: {it.url}")
-                if it.tags: meta_tail.append(f"Tags: {it.tags}")
-                extra = ("\n" + " • ".join(meta_tail)) if meta_tail else ""
-                best_ans, best_sim, best_id = limit_len(it.answer, Config.MAX_INPUT_LEN) + extra, sim, it.id
-    
-        if best_id:
-            await self.db.increment_usage_count(best_id)
-    
-        return best_ans, best_sim, best_id
-
-# ------------------------------------------------------------------------------
-# Scraper (guarded)
-# ------------------------------------------------------------------------------
-class WebScraper:
-    def __init__(self, allowed_hosts: set[str], max_pages: int = 40, timeout: int = 10, concurrency: int = 4):
-        self.allowed_hosts = allowed_hosts
-        self.max_pages = max_pages
-        self.timeout = timeout
-        self.concurrency = concurrency
-        self.last_pages_scanned = 0  # track real fetched page count
-
-        # very conservative denylists to avoid trash pages
-        self.deny_substrings = [
-            "/cart", "/checkout", "/my-account", "/account", "/login", "/wp-admin",
-            "/wp-json", "/feed", "/tag/", "/?add-to-cart=", "/?action=", "/?replytocom=",
-            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".pdf", ".zip", ".mp4", ".mov",
-            "/privacy", "/terms", "/legal", "/cookies", "/cookie", "/gdpr",
-            "/about", "/contact", "/careers", "/jobs", "/press", "/blog", "/news", "/events",
-        ]
-
-        # allow cues for Woo/WordPress catalogs
-        self.allow_cues = [
-            "/product/", "/products/", "/shop/", "/product-category/", "/collections/",
-            "/category/", "/?s=", "post_type=product",
-        ]
-
-        # Search seed terms that expand breadth when deep=True
-        self.seed_terms = [
-            "blue","gold","silver","white","black","ivory","green","pink","red","navy","champagne",
-            "charger","linens","napkin","tablecloth","runner","chiavari","bar","backbar",
-            "flatware","glass","goblet","stemware","china","chair","stool","sofa","lounge",
-            "farm table","round table","banquet","dance floor","heater","umbrella","arch","backdrop"
-        ]
-
-    # ---------- URL helpers ----------
-    def _allowed_host(self, url: str) -> bool:
-        try:
-            host = urlparse(url).netloc.split(":")[0].lower()
-            return any(host == h or host.endswith(f".{h}") for h in self.allowed_hosts)
-        except Exception:
-            return False
-
-    def _canonical(self, url: str) -> str:
-        pr = urlparse(url)
-        if not pr.scheme or not pr.netloc:
-            return ""
-    
-        # lower-case scheme/host
-        scheme = pr.scheme.lower()
-        netloc = pr.netloc.lower()
-    
-        # normalize path: drop common index files and trailing slash (except root)
-        path = re.sub(r"/index\.(?:html?|php)$", "/", pr.path)
-        if len(path) > 1 and path.endswith("/"):
-            path = path[:-1]
-    
-        # drop common tracking params; sort remaining params for stable ordering
-        tracking = {
-            "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-            "gclid", "fbclid", "mc_cid", "mc_eid"
-        }
-        kv = []
-        for p in [x for x in pr.query.split("&") if x]:
-            k, v = p.split("=", 1) if "=" in p else (p, "")
-            k_low = k.lower()
-            if k_low in tracking:
-                continue
-            kv.append((k_low, v))
-        kv.sort()
-        query = "&".join(f"{k}={v}" if v else k for k, v in kv)
-    
-        # strip fragments and rebuild
-        return pr._replace(
-            scheme=scheme, netloc=netloc, path=path, params="", query=query, fragment=""
-        ).geturl()
-
-
-    def _should_visit(self, url: str) -> bool:
-        if not self._allowed_host(url):
-            return False
-        pr = urlparse(url)
-        low = url.lower()
-
-        # Hard denylists
-        if any(s in low for s in self.deny_substrings):
-            return False
-
-        # Block obvious date archives (e.g., /2025/09/, /2024/12/05/)
-        if re.search(r"/20\d{2}/\d{1,2}(/|\b)", pr.path):
-            return False
-
-        # Treat search as catalog only if it's product search
-        if "/?s=" in low or "search=" in low:
-            # allow if explicitly product search (WordPress/Woo or Shopify-ish)
-            if "post_type=product" in low or "/product/" in low or "/products/" in low:
-                return True
-            # else: generic site search -> skip
-            return False
-
-        # Explicit catalog cues always allowed
-        if any(c in low for c in self.allow_cues):
+            
+            self.requests[client_id].append(now)
             return True
 
-        # Generic paths: be strict. Only shallow depths to avoid news/about/etc.
-        depth = pr.path.rstrip("/").count("/")
-        return depth <= 1
-    def _discover_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
-        links = set()
+# ==============================================================================
+# Database Manager
+# ==============================================================================
 
-        # rel="next" pagination (common in Woo/WordPress)
-        for link in soup.find_all("link", rel=lambda x: x and "next" in x):
-            href = link.get("href")
-            if href:
-                links.add(urljoin(base_url, href))
-
-        # anchor tags
-        for a in soup.find_all("a", href=True):
-            href = urljoin(base_url, a["href"])
-            links.add(href)
-
-        # simple pattern-based paginations we care about
-        extras = set()
-        for href in list(links):
-            if re.search(r"/page/\d+/?$", href):  # /page/2/
-                nxt = re.sub(r"/page/(\d+)/?", lambda m: f"/page/{int(m.group(1))+1}/", href)
-                extras.add(nxt)
-            if "product-page=" in href:
-                try:
-                    m = re.search(r"product-page=(\d+)", href)
-                    if m:
-                        nxt = re.sub(r"product-page=\d+", f"product-page={int(m.group(1))+1}", href)
-                        extras.add(nxt)
-                except Exception:
-                    pass
-            if "paged=" in href:
-                try:
-                    m = re.search(r"paged=(\d+)", href)
-                    if m:
-                        nxt = re.sub(r"paged=\d+", f"paged={int(m.group(1))+1}", href)
-                        extras.add(nxt)
-                except Exception:
-                    pass
-        links |= extras
-        return list(links)
-
-    def _clean_text(self, t: str) -> str:
-        lines = [ln.strip() for ln in t.splitlines()]
-        return " ".join([ln for ln in lines if ln])
-
-    def _extract_qa(self, text: str, source: str) -> list[dict[str, str]]:
-        out: list[dict[str, str]] = []
-        sentences = re.split(r'(?<=[\.\!\?])\s+', text)
-        for i, s in enumerate(sentences):
-            s = s.strip()
-            if s.endswith("?") and i + 1 < len(sentences):
-                q = s; a = sentences[i + 1].strip()
-                if 8 < len(q) < 200 and 15 < len(a) < 600:
-                    out.append({"question": q, "answer": a, "source": source})
-        return out
-
-    def _summary_from_text(self, text: str, max_len: int = 700) -> str:
-        if not text: return ""
-        sentences = [s.strip() for s in re.split(r'(?<=[\.\!\?])\s+', text) if s.strip()]
-        buf, total = [], 0
-        for s in sentences:
-            if len(s) < 5: continue
-            if total + len(s) + 1 > max_len: break
-            buf.append(s); total += len(s) + 1
-            if total > max_len * 0.6: break
-        out = " ".join(buf).strip()
-        return out[:max_len] if out else text[:max_len]
-
-    async def _fetch(self, client: httpx.AsyncClient, url: str) -> tuple[str, Optional[BeautifulSoup]]:
-        try:
-            r = await client.get(url, headers={"User-Agent": "TablescapesBot/1.0 (+crawl=limited)"})
-            if r.status_code != 200:
-                return url, None
-            ctype = r.headers.get("content-type", "")
-            if "text/html" not in ctype:
-                return url, None
+class DatabaseManager:
+    """Async database manager with SQLite."""
     
-            soup = BeautifulSoup(r.text, "html.parser")
+    def __init__(self, db_path: str = "./voice_agent.db"):
+        self.db_path = db_path
+        self._initialized = False
     
-            # NEW: honor <link rel="canonical"> to reduce duplicates
-            try:
-                can_link = soup.find("link", rel=lambda v: v and "canonical" in v)
-                if can_link and can_link.get("href"):
-                    can_href = self._canonical(urljoin(url, can_link["href"]))
-                    if can_href:
-                        url = can_href
-            except Exception:
-                pass
-    
-            return url, soup
-        except Exception:
-            return url, None
-
-
-    async def _sitemap_seed(self, client: httpx.AsyncClient, base_root: str) -> list[str]:
-        seeds: list[str] = []
-    
-        async def extract_locs(xml_url: str) -> list[str]:
-            try:
-                r = await client.get(xml_url)
-                if r.status_code != 200 or "xml" not in r.headers.get("content-type",""):
-                    return []
-                xml = r.text
-                return [m.strip() for m in re.findall(r"<loc>(.*?)</loc>", xml, flags=re.I)]
-            except Exception:
-                return []
-    
-        # Try index first; fall back to plain sitemap
-        for path in ("/sitemap_index.xml", "/sitemap.xml"):
-            locs = await extract_locs(urljoin(base_root, path))
-            # If it's an index, fetch each child sitemap and collect their locs
-            expanded: list[str] = []
-            for loc in locs:
-                if loc.lower().endswith(".xml"):
-                    expanded += await extract_locs(loc)
-                else:
-                    expanded.append(loc)
-    
-            for u in expanded or locs:
-                if self._allowed_host(u):
-                    seeds.append(u)
-    
-            if seeds:
-                break  # we found something useful; stop trying the other path
-    
-        # keep it balanced relative to max_pages
-        return seeds[: self.max_pages // 2]
-
-
-    def _deep_search_seeds(self, base_root: str) -> list[str]:
-        # build /shop/ etc plus color/keyword searches (Woo pattern)
-        out = []
-        for term in self.seed_terms:
-            out.append(f"{base_root.rstrip('/')}/?s={quote_plus(term)}&post_type=product")
-        # common catalog roots
-        out += [
-            f"{base_root.rstrip('/')}/shop/",
-            f"{base_root.rstrip('/')}/products/",
-            f"{base_root.rstrip('/')}/product-category/",
-            f"{base_root.rstrip('/')}/collections/",
-        ]
-        return out
-
-    async def scrape(self, base_url: str, *, deep: bool = False, max_pages: Optional[int] = None) -> list[dict[str,str]]:
-        if not self._allowed_host(base_url):
-            raise ValueError("Host not allowed by ALLOWED_SCRAPE_HOSTS")
-
-        limit = max_pages or self.max_pages
-        results: list[dict[str, str]] = []
-        seen: set[str] = set()
-        queue: list[str] = []
-       
-
-        # initial seeds
-        base_root = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
-        # Seed with the exact URL the user passed
-        root = self._canonical(base_url)
-        if root and self._should_visit(root) and root not in seen and root not in queue:
-            queue.append(root)
+    async def initialize(self):
+        """Initialize database and create tables."""
+        if self._initialized:
+            return
         
-        # Also seed the site home (base_root), which often fan-outs to categories
-        home = self._canonical(base_root)
-        if home and self._should_visit(home) and home not in seen and home not in queue:
-            queue.append(home)
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-            # add sitemap seeds
-            if deep:
-                sm = await self._sitemap_seed(client, base_root)
-                for u in sm:
-                    cu = self._canonical(u)
-                    if cu and self._should_visit(cu):
-                        queue.append(cu)
-                # add deep search seeds
-                for u in self._deep_search_seeds(base_root):
-                    cu = self._canonical(u)
-                    if cu and self._should_visit(cu):
-                        queue.append(cu)
+        async with aiosqlite.connect(self.db_path) as db:
+            # Create tables
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS calls (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT UNIQUE NOT NULL,
+                    status TEXT NOT NULL,
+                    transcript TEXT DEFAULT '',
+                    confidence_score REAL DEFAULT 0.0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    metadata TEXT DEFAULT '{}'
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS knowledge_items (
+                    id TEXT PRIMARY KEY,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    category TEXT,
+                    source TEXT,
+                    usage_count INTEGER DEFAULT 0,
+                    confidence_threshold REAL DEFAULT 0.75,
+                    active BOOLEAN DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS unknown_questions (
+                    id TEXT PRIMARY KEY,
+                    call_id TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    suggested_answer TEXT,
+                    resolved BOOLEAN DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (call_id) REFERENCES calls (id)
+                )
+            """)
+            
+            # Create indexes
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_calls_session ON calls(session_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_active ON knowledge_items(active)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_unknown_resolved ON unknown_questions(resolved)")
+            
+            await db.commit()
+        
+        self._initialized = True
+        logger.info("Database initialized")
+    
+    async def create_call(self, session_id: str) -> str:
+        """Create a new call record."""
+        call_id = str(uuid4())
+        now = datetime.utcnow().isoformat()
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO calls (id, session_id, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (call_id, session_id, CallStatus.ACTIVE.value, now, now))
+            await db.commit()
+        
+        return call_id
+    
+    async def update_call(self, call_id: str, **updates) -> bool:
+        """Update call record."""
+        if not updates:
+            return False
+        
+        # Prepare update query
+        set_clauses = []
+        values = []
+        for key, value in updates.items():
+            set_clauses.append(f"{key} = ?")
+            values.append(value)
+        
+        set_clauses.append("updated_at = ?")
+        values.append(datetime.utcnow().isoformat())
+        values.append(call_id)
+        
+        query = f"UPDATE calls SET {', '.join(set_clauses)} WHERE id = ?"
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(query, values)
+            await db.commit()
+        
+        return True
+    
+    async def add_knowledge_item(self, item: KnowledgeItem) -> str:
+        """Add knowledge base item."""
+        item_id = str(uuid4())
+        now = datetime.utcnow().isoformat()
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO knowledge_items 
+                (id, question, answer, category, source, confidence_threshold, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (item_id, item.question, item.answer, item.category, item.source,
+                  item.confidence_threshold, now, now))
+            await db.commit()
+        
+        return item_id
+    
+    async def get_knowledge_items(self, active_only: bool = True) -> List[KnowledgeItem]:
+        """Get all knowledge base items."""
+        query = "SELECT * FROM knowledge_items"
+        params = []
+        
+        if active_only:
+            query += " WHERE active = ?"
+            params.append(1)
+        
+        query += " ORDER BY usage_count DESC, created_at DESC"
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+        
+        items = []
+        for row in rows:
+            items.append(KnowledgeItem(
+                id=row['id'],
+                question=row['question'],
+                answer=row['answer'],
+                category=row['category'],
+                source=row['source'],
+                usage_count=row['usage_count'],
+                confidence_threshold=row['confidence_threshold'],
+                active=bool(row['active']),
+                created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None,
+                updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None
+            ))
+        
+        return items
+    
+    async def increment_usage(self, item_id: str):
+        """Increment usage count for knowledge item."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE knowledge_items SET usage_count = usage_count + 1, updated_at = ?
+                WHERE id = ?
+            """, (datetime.utcnow().isoformat(), item_id))
+            await db.commit()
+    
+    async def add_unknown_question(self, question: UnknownQuestion) -> str:
+        """Add unknown question."""
+        question_id = str(uuid4())
+        now = datetime.utcnow().isoformat()
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO unknown_questions (id, call_id, question, suggested_answer, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (question_id, question.call_id, question.question, 
+                  question.suggested_answer, now))
+            await db.commit()
+        
+        return question_id
+    
+    async def get_unknown_questions(self, resolved: bool = False, limit: int = 100) -> List[UnknownQuestion]:
+        """Get unknown questions."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM unknown_questions WHERE resolved = ? 
+                ORDER BY created_at DESC LIMIT ?
+            """, (int(resolved), limit)) as cursor:
+                rows = await cursor.fetchall()
+        
+        questions = []
+        for row in rows:
+            questions.append(UnknownQuestion(
+                id=row['id'],
+                call_id=row['call_id'],
+                question=row['question'],
+                suggested_answer=row['suggested_answer'],
+                resolved=bool(row['resolved']),
+                created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None
+            ))
+        
+        return questions
+    
+    async def get_stats(self) -> Dict[str, Any]:
+        """Get system statistics."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Total calls
+            async with db.execute("SELECT COUNT(*) FROM calls") as cursor:
+                total_calls = (await cursor.fetchone())[0]
+            
+            # Active calls
+            async with db.execute("SELECT COUNT(*) FROM calls WHERE status = ?", 
+                                (CallStatus.ACTIVE.value,)) as cursor:
+                active_calls = (await cursor.fetchone())[0]
+            
+            # Knowledge items
+            async with db.execute("SELECT COUNT(*) FROM knowledge_items WHERE active = 1") as cursor:
+                knowledge_items = (await cursor.fetchone())[0]
+            
+            # Unresolved questions
+            async with db.execute("SELECT COUNT(*) FROM unknown_questions WHERE resolved = 0") as cursor:
+                unknown_questions = (await cursor.fetchone())[0]
+        
+        return {
+            "total_calls": total_calls,
+            "active_calls": active_calls,
+            "knowledge_items": knowledge_items,
+            "unknown_questions": unknown_questions,
+            "uptime": time.time() - start_time
+        }
 
-            sem = asyncio.Semaphore(self.concurrency)
+# ==============================================================================
+# AI Engine
+# ==============================================================================
 
-            async def crawl_one(u: str):
-                async with sem:
-                    can = self._canonical(u)
-                    if not can or can in seen or not self._should_visit(can):
-                        return [], []
-                    # fetch first (it may rewrite to canonical via <link rel=canonical>)
-                    url, soup = await self._fetch(client, can)
-                    if not soup:
-                        return [], []
+class AIEngine:
+    """AI engine with multiple providers and fallbacks."""
+    
+    def __init__(self):
+        self.openai_client = None
+        self.embedding_model = None
+        self.cache = TTLCache(maxsize=1000, ttl=settings.CACHE_TTL)
+        self.circuit_breaker = CircuitBreaker()
+        
+        # Initialize OpenAI if available
+        if OPENAI_AVAILABLE and settings.OPENAI_API_KEY:
+            self.openai_client = openai.AsyncOpenAI(
+                api_key=settings.OPENAI_API_KEY,
+                timeout=30.0
+            )
+            logger.info("OpenAI client initialized")
+        
+        # Initialize embedding model if available
+        if EMBEDDINGS_AVAILABLE:
+            try:
+                self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+                logger.info("Embedding model loaded")
+            except Exception as e:
+                logger.warning(f"Failed to load embedding model: {e}")
+    
+    async def speech_to_text(self, audio_data: bytes) -> Optional[str]:
+        """Convert audio to text."""
+        if not self.openai_client or not self.circuit_breaker.can_execute():
+            return None
+        
+        try:
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as temp_file:
+                temp_file.write(audio_data)
+                temp_file.flush()
+                
+                # Transcribe
+                with open(temp_file.name, 'rb') as audio_file:
+                    response = await self.openai_client.audio.transcriptions.create(
+                        model=settings.OPENAI_WHISPER_MODEL,
+                        file=audio_file,
+                        response_format="text"
+                    )
+                
+                # Clean up
+                Path(temp_file.name).unlink(missing_ok=True)
+                
+                self.circuit_breaker.record_success()
+                return response.strip() if response else None
+                
+        except Exception as e:
+            logger.error(f"STT error: {e}")
+            self.circuit_breaker.record_failure()
+            Path(temp_file.name).unlink(missing_ok=True)
+            return None
+    
+    async def text_to_speech(self, text: str) -> Optional[bytes]:
+        """Convert text to speech."""
+        if not GTTS_AVAILABLE:
+            return None
+        
+        try:
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                tts = gTTS(text=text, lang='en', slow=False)
+                tts.save(temp_file.name)
+                
+                with open(temp_file.name, 'rb') as audio_file:
+                    audio_data = audio_file.read()
+                
+                Path(temp_file.name).unlink(missing_ok=True)
+                return audio_data
+                
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+            return None
+    
+    async def generate_response(self, message: str, context: List[ChatMessage] = None) -> str:
+        """Generate conversational response."""
+        # Check cache first
+        cache_key = f"response:{hashlib.md5(message.encode()).hexdigest()}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        # Try OpenAI first
+        if self.openai_client and self.circuit_breaker.can_execute():
+            try:
+                messages = [
+                    {"role": "system", "content": "You are a helpful AI assistant. Provide concise, accurate responses."}
+                ]
+                
+                # Add context
+                if context:
+                    for msg in context[-5:]:  # Last 5 messages
+                        messages.append({"role": msg.role.value, "content": msg.content})
+                
+                # Add current message
+                messages.append({"role": "user", "content": message})
+                
+                response = await self.openai_client.chat.completions.create(
+                    model=settings.OPENAI_MODEL,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=200
+                )
+                
+                result = response.choices[0].message.content.strip()
+                self.circuit_breaker.record_success()
+                self.cache.set(cache_key, result)
+                return result
+                
+            except Exception as e:
+                logger.error(f"OpenAI chat error: {e}")
+                self.circuit_breaker.record_failure()
+        
+        # Fallback to simple responses
+        return self._fallback_response(message)
+    
+    def _fallback_response(self, message: str) -> str:
+        """Simple fallback response system."""
+        msg_lower = message.lower()
+        
+        # Greetings
+        if any(word in msg_lower for word in ['hello', 'hi', 'hey', 'good morning', 'good afternoon']):
+            return "Hello! How can I help you today?"
+        
+        # Thanks
+        if any(word in msg_lower for word in ['thank', 'thanks']):
+            return "You're welcome! Is there anything else I can help you with?"
+        
+        # Goodbye
+        if any(word in msg_lower for word in ['bye', 'goodbye', 'see you']):
+            return "Goodbye! Have a great day!"
+        
+        # Help
+        if any(word in msg_lower for word in ['help', 'support']):
+            return "I'm here to help! What can I assist you with?"
+        
+        # Default
+        return "I understand. Let me connect you with someone who can help with that specific question."
+    
+    async def generate_embedding(self, text: str) -> Optional[List[float]]:
+        """Generate text embedding."""
+        if not self.embedding_model:
+            # Simple fallback embedding
+            words = text.lower().split()
+            # Create a simple hash-based embedding
+            embedding = [0.0] * 384  # Common embedding size
+            for i, word in enumerate(words[:10]):  # Use first 10 words
+                hash_val = hash(word) % 384
+                embedding[hash_val] += 1.0
+            # Normalize
+            total = sum(embedding) or 1.0
+            return [val / total for val in embedding]
+        
+        try:
+            embedding = self.embedding_model.encode(text, convert_to_tensor=False)
+            return embedding.tolist()
+        except Exception as e:
+            logger.error(f"Embedding error: {e}")
+            return None
+    
+    def calculate_similarity(self, embedding1: List[float], embedding2: List[float]) -> float:
+        """Calculate cosine similarity between embeddings."""
+        if not embedding1 or not embedding2:
+            return 0.0
+        
+        # Simple cosine similarity
+        dot_product = sum(a * b for a, b in zip(embedding1, embedding2))
+        norm1 = sum(a * a for a in embedding1) ** 0.5
+        norm2 = sum(b * b for b in embedding2) ** 0.5
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return dot_product / (norm1 * norm2)
 
-                    
-                    # Mark the effective canonical URL as seen (prefer rewritten URL if present)
-                    effective = url or can
-                    if effective in seen:
-                        return [], []
-                    seen.add(effective)
- 
-                    text = self._clean_text(soup.get_text(" "))
-                    qa = self._extract_qa(text, url)
-                    if not qa:
-                        title = (soup.title.string.strip() if soup.title and soup.title.string else "Page")
-                        summary = self._summary_from_text(text, 700)
-                        if summary:
-                            qa = [{"question": f"{title} – summary"[:200], "answer": summary, "source": url}]
-                    nexts = []
-                    for v in self._discover_links(soup, url):
-                        cv = self._canonical(v)
-                        if cv and cv not in seen and self._should_visit(cv):
-                            nexts.append(cv)
-                    return qa, nexts
+# ==============================================================================
+# Knowledge Manager
+# ==============================================================================
 
-            idx = 0
-            while queue and len(seen) < limit:
-                batch = []
-                while queue and len(batch) < self.concurrency and len(seen) + len(batch) < limit:
-                    batch.append(queue.pop(0))
-                tasks = [asyncio.create_task(crawl_one(u)) for u in batch]
-                for t in asyncio.as_completed(tasks):
-                    qa, nexts = await t
-                    results.extend(qa)
+class KnowledgeManager:
+    """Knowledge base manager with similarity search."""
+    
+    def __init__(self, db_manager: DatabaseManager, ai_engine: AIEngine):
+        self.db_manager = db_manager
+        self.ai_engine = ai_engine
+        self.items_cache = TTLCache(maxsize=1000, ttl=1800)  # 30 minutes
+    
+    async def find_answer(self, question: str) -> Tuple[str, float, Optional[str]]:
+        """Find answer in knowledge base."""
+        # Get cached items or load from database
+        items = self.items_cache.get("all_items")
+        if items is None:
+            items = await self.db_manager.get_knowledge_items()
+            self.items_cache.set("all_items", items)
+        
+        if not items:
+            return "", 0.0, None
+        
+        # Generate embedding for question
+        question_embedding = await self.ai_engine.generate_embedding(question)
+        if not question_embedding:
+            # Fallback to simple text matching
+            return await self._text_similarity_search(question, items)
+        
+        best_item = None
+        best_similarity = 0.0
+        
+        # Search through items
+        for item in items:
+            if not item.active:
+                continue
+            
+            # Generate embedding for item if needed
+            item_embedding = await self.ai_engine.generate_embedding(item.question)
+            if not item_embedding:
+                continue
+            
+            # Calculate similarity
+            similarity = self.ai_engine.calculate_similarity(question_embedding, item_embedding)
+            
+            if similarity > best_similarity and similarity >= item.confidence_threshold:
+                best_similarity = similarity
+                best_item = item
+        
+        if best_item:
+            # Increment usage count
+            await self.db_manager.increment_usage(best_item.id)
+            return best_item.answer, best_similarity, best_item.id
+        
+        return "", 0.0, None
+    
+    async def _text_similarity_search(self, question: str, items: List[KnowledgeItem]) -> Tuple[str, float, Optional[str]]:
+        """Fallback text similarity search."""
+        question_words = set(question.lower().split())
+        
+        best_item = None
+        best_score = 0.0
+        
+        for item in items:
+            if not item.active:
+                continue
+            
+            item_words = set(item.question.lower().split())
+            
+            # Jaccard similarity
+            intersection = len(question_words & item_words)
+            union = len(question_words | item_words)
+            
+            if union > 0:
+                score = intersection / union
+                if score > best_score and score >= 0.3:  # Minimum threshold
+                    best_score = score
+                    best_item = item
+        
+        if best_item:
+            await self.db_manager.increment_usage(best_item.id)
+            return best_item.answer, best_score, best_item.id
+        
+        return "", 0.0, None
+    
+    async def add_item(self, item: KnowledgeItem) -> str:
+        """Add new knowledge item."""
+        item_id = await self.db_manager.add_knowledge_item(item)
+        # Clear cache to force reload
+        self.items_cache.set("all_items", None)
+        return item_id
 
-                    for n in nexts:
-                        if len(seen) + len(queue) >= limit:
-                            break
-                        if n not in seen and n not in queue and self._should_visit(n):
-                            queue.append(n)
+# ==============================================================================
+# Global Services
+# ==============================================================================
 
-        logger.info(f"Scrape finished: pages_scanned={len(seen)} items={len(results)} deep={deep}")
-        self.last_pages_scanned = len(seen)
-        return results
+# Initialize services
+start_time = time.time()
+db_manager = DatabaseManager(settings.DATABASE_PATH)
+ai_engine = AIEngine()
+knowledge_manager = KnowledgeManager(db_manager, ai_engine)
+connection_manager = ConnectionManager(settings.MAX_CONNECTIONS)
+rate_limiter = RateLimiter(settings.RATE_LIMIT_REQUESTS, settings.RATE_LIMIT_WINDOW)
 
-# ------------------------------------------------------------------------------
-# App wiring
-# ------------------------------------------------------------------------------
-db_manager = DatabaseManager(Config.DATABASE_PATH)
-ai_engine = LightweightAIEngine()
-knowledge_manager = KnowledgeBaseManager(ai_engine, db_manager)
-scraper = WebScraper(
-    Config.ALLOWED_SCRAPE_HOSTS,
-    Config.SCRAPE_MAX_PAGES,
-    Config.SCRAPE_TIMEOUT,
-    Config.SCRAPE_CONCURRENCY,
-)
+# ==============================================================================
+# FastAPI Application
+# ==============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await db_manager.init_database()
-    await knowledge_manager.load()
-    if not ffmpeg_available():
-        logger.warning("ffmpeg not found; STT will attempt WEBM directly; results may be worse.")
-    eff_port = int(os.getenv("PORT", str(Config.PORT)))
-    external = os.getenv("RENDER_EXTERNAL_URL")
-    if external:
-        base_url = external.rstrip("/")
-        ws_url = base_url.replace("https://", "wss://") + "/ws/voice"
-    else:
-        base_url = f"http://localhost:{eff_port}"
-        ws_url = f"ws://localhost:{eff_port}/ws/voice"
-    try: Config.BASE_URL = base_url
-    except Exception: pass
-    logger.info("Starting AI Voice Agent System (Comprehensive)")
-    logger.info(f"Dashboard (effective): {base_url}")
-    logger.info(f"WS (effective):        {ws_url}")
-    logger.info(f"Configured BASE_URL:   {Config.BASE_URL}")
-    logger.info("Startup complete.")
+    """Application lifespan management."""
+    # Startup
+    logger.info("Starting AI Voice Agent System...")
+    await db_manager.initialize()
+    
+    # Add some default knowledge items if empty
+    items = await db_manager.get_knowledge_items()
+    if not items:
+        default_items = [
+            KnowledgeItem(
+                question="What services do you offer?",
+                answer="We offer AI-powered customer service with voice and chat capabilities. Our system can handle inquiries, provide information, and transfer to human agents when needed.",
+                category="general",
+                source="default"
+            ),
+            KnowledgeItem(
+                question="How does the voice system work?",
+                answer="Our voice system uses advanced AI to convert your speech to text, understand your question, and provide spoken responses. Just click the microphone button and start talking!",
+                category="technical",
+                source="default"
+            ),
+            KnowledgeItem(
+                question="Can I speak to a human?",
+                answer="Of course! While our AI handles many questions effectively, you can always request to speak with a human agent. Just say 'I want to speak to a person' or similar.",
+                category="support",
+                source="default"
+            )
+        ]
+        
+        for item in default_items:
+            await knowledge_manager.add_item(item)
+        
+        logger.info("Added default knowledge items")
+    
+    logger.info("System startup complete")
     yield
+    
+    # Shutdown
+    logger.info("Shutting down...")
 
-app = FastAPI(title="AI Voice Agent System - Comprehensive", version="2.0.0", lifespan=lifespan)
-
-@app.head("/", include_in_schema=False)
-def root_head():
-    return Response(status_code=200)
-
-@app.head("/healthz", include_in_schema=False)
-def healthz_head():
-    return Response(status_code=200)
-
-
-@app.head("/admin", include_in_schema=False)
-def admin_head():
-    return Response(status_code=200)
-
-@app.head("/chat", include_in_schema=False)
-def chat_head():
-    return Response(status_code=200)
-
-
-@app.get("/healthz", include_in_schema=False)
-def healthz():
-    return {"status": "ok"}
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=Config.CORS_ORIGINS if Config.CORS_ORIGINS else ["*"],
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+app = FastAPI(
+    title="AI Voice Agent System",
+    description="Production-ready AI voice agent with comprehensive features",
+    version="2.0.0",
+    lifespan=lifespan
 )
 
-# ------------------------------------------------------------------------------
-# Voice UI (/) – same as before (omitted for brevity), Chat UI (/chat), Admin (/admin)
-# To keep this file a bit shorter, we re-use your previous HTML blocks 1:1.
-# You can paste the exact same HTML you already had for "/", "/chat", and "/admin".
-# ------------------------------------------------------------------------------
-# For space, I include just Chat + Admin (they rely on /api routes below).
+# Add middleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse("""<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<title>AI Voice Agent</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root { --bg:#0f172a; --fg:#e2e8f0; --muted:#94a3b8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444; --btn:#1e40af; --btn2:#0891b2; }
-* { box-sizing:border-box }
-body { background:var(--bg); color:var(--fg); font:16px/1.4 Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin:0; padding:24px }
-h1 { margin:0 0 12px 0 }
-.card { background:#0b1220; border:1px solid #263147; border-radius:14px; padding:16px; margin:16px 0; box-shadow:0 0 0 1px rgba(255,255,255,.02) inset }
-.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0 }
-button { padding:12px 16px; border-radius:12px; border:none; background:var(--btn); color:white; cursor:pointer; font-weight:600 }
-button.secondary { background:var(--btn2) }
-button.danger { background:var(--err) }
-button:disabled { opacity:.5; cursor:not-allowed }
-.toggle { display:flex; align-items:center; gap:8px }
-.badge { display:inline-block; padding:4px 10px; border-radius:999px; background:#172036; color:#a6b0c6; font-size:12px; }
-#log { white-space:pre-wrap; background:#0a0f1f; color:#cfe8ff; padding:12px; border-radius:12px; min-height:140px; max-height:300px; overflow:auto }
-label { color:#9fb2d4; font-size:14px }
-a.link { color:#7dd3fc; text-decoration:none }
-</style>
-<h1>AI Voice Agent</h1>
+# ==============================================================================
+# WebSocket Endpoint
+# ==============================================================================
 
-<div class="card">
-  <div class="row"><span>Status:</span> <span id="status" class="badge">Idle</span></div>
-  <div class="row">
-    <div class="toggle">
-      <input type="checkbox" id="useBrowserSTT" checked>
-      <label for="useBrowserSTT">Use Browser STT (Web Speech API)</label>
-    </div>
-  </div>
-  <div class="row">
-    <button id="connectBtn">Connect</button>
-    <button id="startBtn" disabled>Start</button>
-    <button id="stopBtn" disabled>Stop</button>
-    <button id="disconnectBtn" class="danger" disabled>Disconnect</button>
-  </div>
-  <div class="row">
-    <audio id="player" controls></audio>
-  </div>
-</div>
-
-<div class="card">
-  <h3 style="margin:0 0 8px 0;">Log</h3>
-  <div id="log"></div>
-  <div class="row"><a class="link" href="/admin" target="_blank">Open Admin Console →</a> <a class="link" href="/chat" target="_blank" style="margin-left:8px">Open Chat →</a></div>
-</div>
-
-<script>
-(() => {
-  const statusEl = document.getElementById('status');
-  const logEl = document.getElementById('log');
-  const player = document.getElementById('player');
-  const useBrowserSTT = document.getElementById('useBrowserSTT');
-
-  const connectBtn = document.getElementById('connectBtn');
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn = document.getElementById('stopBtn');
-  const disconnectBtn = document.getElementById('disconnectBtn');
-
-  let ws = null, stream = null, recorder = null, speech = null;
-
-  function log(msg, obj){
-    const s = (new Date()).toLocaleTimeString() + " — " + msg + (obj? " " + JSON.stringify(obj): "");
-    logEl.textContent += s + "\\n";
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-  function setStatus(s){ statusEl.textContent = s; }
-
-  function wsUrl(){
-    const proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
-    return proto + location.host + '/ws/voice';
-  }
-
-  function keepAlive(){
-    if(ws && ws.readyState === WebSocket.OPEN){
-      ws.send(JSON.stringify({type:'ping'}));
-    }
-  }
-  setInterval(keepAlive, 20000);
-
-  function enableControls(connected){
-    connectBtn.disabled = connected;
-    startBtn.disabled = !connected;
-    stopBtn.disabled = true;
-    disconnectBtn.disabled = !connected;
-  }
-
-  connectBtn.onclick = () => {
-    if(ws && ws.readyState === WebSocket.OPEN) return;
-    ws = new WebSocket(wsUrl());
-    ws.binaryType = 'arraybuffer';
-    setStatus('Connecting');
-    ws.onopen = () => { setStatus('Connected'); log('WS open'); enableControls(true); };
-    ws.onclose = ev => {
-      setStatus('Disconnected'); log('WS close', {code: ev.code, reason: ev.reason});
-      if(recorder && recorder.state !== 'inactive') recorder.stop();
-      if(stream) { stream.getTracks().forEach(t=>t.stop()); stream = null; }
-      if(speech) try{ speech.stop(); }catch(e){}
-      enableControls(false);
-    };
-    ws.onerror = () => { log('WS error'); };
-    ws.onmessage = ev => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if(msg.type === 'heartbeat') setStatus('Connected (heartbeat)');
-        else if(msg.type === 'listening') setStatus('Listening…');
-        else if(msg.type === 'response'){
-          setStatus('Responded');
-          log('Agent: ' + msg.text + ' (conf=' + (msg.confidence ?? 0).toFixed(2) + ', source=' + (msg.source||'') + ')');
-          if(msg.audio_b64 && msg.audio_mime){
-            player.src = 'data:' + msg.audio_mime + ';base64,' + msg.audio_b64;
-            player.play().catch(()=>{});
-          }
-        } else if(msg.type === 'transfer'){ setStatus('Transfer'); log('Transfer: ' + msg.message); }
-        else if(msg.type === 'error'){ setStatus('Error'); log('Server error: ' + msg.message); }
-        else if(msg.type === 'closing'){ setStatus('Closing: ' + (msg.reason||'')); }
-        else { log('Recv', msg); }
-      } catch(e) { log('Non-JSON message'); }
-    };
-  };
-
-  startBtn.onclick = async () => {
-    if(!ws || ws.readyState !== WebSocket.OPEN) { log('WS not open'); return; }
-    const useBrowser = useBrowserSTT.checked;
-
-    if(useBrowser){
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if(!SR) {
-        alert('Web Speech API not supported. Disable "Use Browser STT" or use Chrome.');
-        return;
-      }
-      speech = new SR();
-      speech.lang = 'en-US';
-      speech.interimResults = true;
-      speech.continuous = true;
-      speech.onresult = (e) => {
-        let finalText = '';
-        for(let i=e.resultIndex; i<e.results.length; i++) {
-          if(e.results[i].isFinal) finalText += e.results[i][0].transcript;
-        }
-        if(finalText.trim() && ws && ws.readyState === WebSocket.OPEN){
-          ws.send(JSON.stringify({type:'text', text: finalText}));
-        }
-      };
-      speech.onerror = (e)=> log('Speech error: ' + e.error);
-      speech.onend = ()=> log('Speech end');
-      try { speech.start(); setStatus('Browser STT Running'); }
-      catch(err){ log('Speech start failed: ' + err); }
-      startBtn.disabled = true; stopBtn.disabled = false; disconnectBtn.disabled = false;
-      return;
-    }
-
-    if(!navigator.mediaDevices || !window.MediaRecorder){
-      alert('MediaRecorder not supported in this browser.');
-      return;
-    }
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({audio: true});
-      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' :
-                   (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
-      recorder = new MediaRecorder(stream, mime ? {mimeType: mime, audioBitsPerSecond: 32000} : undefined);
-      recorder.ondataavailable = async (e) => {
-        if(e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN){
-          const buf = await e.data.arrayBuffer();
-          ws.send(buf);
-        }
-      };
-      recorder.start(1000);
-      setStatus('Recording'); startBtn.disabled = true; stopBtn.disabled = false; disconnectBtn.disabled = false;
-      log('Recorder started with mime=' + (mime||'default'));
-    } catch(err){
-      log('getUserMedia error: ' + err);
-    }
-  };
-
-  stopBtn.onclick = () => {
-    if(recorder && recorder.state !== 'inactive') recorder.stop();
-    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
-    if(speech) try{ speech.stop(); }catch(e){}
-    setStatus('Connected'); startBtn.disabled = false; stopBtn.disabled = true; log('Stopped');
-  };
-
-  disconnectBtn.onclick = () => {
-    if(recorder && recorder.state !== 'inactive') recorder.stop();
-    if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
-    if(speech) try{ speech.stop(); }catch(e){}
-    if(ws){ ws.close(1000, 'client_close'); }
-  };
-})();
-</script>
-</html>
-""")
-
-@app.get("/api/knowledge/export_csv")
-async def api_export_kb_csv():
-    items = await db_manager.get_knowledge_base()
-
-    def generate():
-        import csv, io
-        buf = io.StringIO()
-        buf.write("\ufeff")  # BOM for Excel
-        writer = csv.writer(buf)
-        writer.writerow(["id","question","answer","source","url","nav_path","tags","usage_count","last_updated"])
-        for it in items:
-            writer.writerow([
-                it.id,
-                it.question or "",
-                it.answer or "",
-                it.source or "",
-                it.url or "",
-                it.nav_path or "",
-                it.tags or "",
-                it.usage_count or 0,
-                it.last_updated.isoformat() if it.last_updated else ""
-            ])
-        buf.seek(0)
-        yield buf.read()
-
-    headers = {
-        "Content-Disposition": 'attachment; filename="knowledge_base.csv"',
-        "Content-Type": "text/csv; charset=utf-8"
-    }
-    return StreamingResponse(generate(), headers=headers)
-
-
-@app.get("/chat", response_class=HTMLResponse)
-async def chat_page():
-    return HTMLResponse("""<!doctype html>
-<html lang="en"><meta charset="utf-8"><title>AI Voice Agent – Chat</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-:root { --bg:#0f172a; --fg:#e2e8f0; --muted:#94a3b8; --card:#0b1220; --border:#263147; --btn:#1e40af; }
-*{box-sizing:border-box} body{background:var(--bg);color:var(--fg);font:16px/1.4 Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;padding:24px}
-h1{margin:0 0 12px 0} .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;margin:16px 0}
-#msgs{max-height:60vh;overflow:auto;padding:12px;background:#0a0f1f;border-radius:12px}
-.msg{margin:8px 0;padding:10px;border-radius:10px;border:1px solid var(--border)}
-.msg.user{background:#0f1a33} .msg.assistant{background:#101b2e}
-small{color:var(--muted)} input,button{font:16px}
-input{width:100%;padding:12px;border-radius:12px;border:1px solid var(--border);background:#0a0f1f;color:#cfe8ff}
-button{padding:12px 16px;border-radius:12px;border:none;background:var(--btn);color:#fff;font-weight:600;cursor:pointer}
-.row{display:flex;gap:8px;margin-top:8px}
-</style>
-<h1>Chat</h1>
-<div class="card">
-  <div id="msgs" aria-live="polite"></div>
-  <div class="row">
-    <input id="inp" placeholder="Type a message and press Enter">
-    <button id="send">Send</button>
-  </div>
-  <div class="row"><small id="meta"></small></div>
-</div>
-<script>
-(() => {
-  const msgs = document.getElementById('msgs');
-  const inp  = document.getElementById('inp');
-  const btn  = document.getElementById('send');
-  const meta = document.getElementById('meta');
-  const history = [];
-  function add(role, text){
-    const d = document.createElement('div');
-    d.className = 'msg ' + role;
-    d.innerHTML = '<strong>' + (role==='user'?'You':'Agent') + ':</strong> ' + text;
-    msgs.appendChild(d); msgs.scrollTop = msgs.scrollHeight;
-  }
-  async function send(){
-    const text = inp.value.trim(); if(!text) return;
-    add('user', text); history.push({role:'user', text}); inp.value=''; meta.textContent='';
-    try{
-      const r = await fetch('/api/chat', { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({message: text, history}) });
-      const j = await r.json();
-      if(!j.ok){ add('assistant', 'Error: ' + (j.error||'unknown')); return; }
-      add('assistant', j.reply);
-      history.push({role:'assistant', text: j.reply});
-      meta.textContent = 'source=' + j.source + (typeof j.confidence==='number' ? ' • kb_conf=' + j.confidence.toFixed(2) : '');
-    }catch(e){ add('assistant', 'Network error.'); }
-  }
-  btn.onclick = send; inp.addEventListener('keydown', e => { if(e.key==='Enter') send(); });
-})();
-</script>
-</html>""")
-
-@app.get("/admin", response_class=HTMLResponse)
-async def admin():
-    return HTMLResponse("""
-<!doctype html><meta charset="utf-8"><title>Admin Console – AI Voice Agent (Dev)</title>
-<style>
-  body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0f172a;color:#e5e7eb;margin:0;padding:24px}
-  .card{background:#0b1220;border:1px solid #263147;border-radius:14px;padding:16px;margin:16px 0}
-  input,textarea{width:100%;padding:10px;border-radius:10px;border:1px solid #263147;background:#0a0f1f;color:#dbeafe}
-  button{padding:10px 14px;border-radius:10px;border:none;background:#2563eb;color:white;cursor:pointer;font-weight:600}
-  table{width:100%;border-collapse:collapse} th,td{border-bottom:1px solid #263147;padding:8px;text-align:left}
-  .muted{color:#93a0b8;font-size:12px}
-</style>
-<h1>Admin Console <span class="muted">(dev only)</span></h1>
-
-<div class="card">
-  <h3>Add KB Item</h3>
-  <div><input id="q" placeholder="Question"></div>
-  <div style="margin-top:8px"><textarea id="a" rows="4" placeholder="Answer"></textarea></div>
-  <div style="margin-top:8px"><input id="url" placeholder="(optional) URL"><input id="nav" placeholder="(optional) Menu path"><input id="tags" placeholder="(optional) tags, comma-separated"></div>
-  <div style="margin-top:8px"><button onclick="addKB()">Add</button></div>
-</div>
-
-<div class="card">
-  <h3>Bulk Add KB (CSV)</h3>
-  <p class="muted">Columns: <b>question, answer [, source] [, url] [, nav_path] [, tags]</b>. Header row optional. Use CSV quoting if a field contains commas.</p>
-  <textarea id="csvBulk" rows="8" placeholder='question,answer,source,url,nav_path,tags
-"Do you have blue charger plates?","Yes! Try this search link.","kb",,"Shop → Chargers","chargers,blue"'></textarea>
-  <div style="margin-top:8px"><button onclick="bulkCSV()">Upload CSV</button></div>
-  <pre id="bulkOut" class="muted"></pre>
-</div>
-
-<div class="card">
-  <h3>Scrape Website (allowed hosts only)</h3>
-  <input id="scrapeUrl" placeholder="https://www.tablescapes.com">
-  <button onclick="scrape()">Scrape</button>
-  <div id="scrapeResult" class="muted"></div>
-</div>
-<div class="row" style="margin-top:8px">
-  <label><input id="scrapeDeep" type="checkbox"> Deep crawl</label>
-  <input id="scrapeMax" type="number" min="1" max="1000" placeholder="max pages (e.g. 300)" style="margin-left:12px">
-</div>
-<div class="card">
-  <h3>Unknown Questions</h3>
-  <div id="unknowns"></div>
-</div>
-<div class="card">
-  <h3>Export</h3>
-  <button onclick="downloadKB()">Download KB (CSV)</button>
-</div>
-
-<div class="card">
-  <h3>Stats</h3>
-  <pre id="stats"></pre>
-</div>
-
-<script>
-
-async function addKB(){
-  const q = document.getElementById('q').value.trim();
-  const a = document.getElementById('a').value.trim();
-  const url = document.getElementById('url').value.trim();
-  const nav = document.getElementById('nav').value.trim();
-  const tags = document.getElementById('tags').value.trim();
-  if(!q || !a){ alert('Enter both question and answer'); return; }
-  const r = await fetch('/api/knowledge/add', {method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({question:q,answer:a,url:url||null,nav_path:nav||null,tags:tags||null})});
-  const j = await r.json(); alert(j.message || 'OK'); loadUnknowns(); loadStats();
-}
-async function bulkCSV(){
-  const csv = document.getElementById('csvBulk').value;
-  const out = document.getElementById('bulkOut');
-  out.textContent = 'Uploading...';
-  try{
-    const r = await fetch('/api/knowledge/bulk_csv', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({csv})});
-    const j = await r.json(); out.textContent = JSON.stringify(j, null, 2); loadStats();
-  }catch(e){ out.textContent = 'Error: ' + String(e); }
-}
-async function scrape(){
-  const url = document.getElementById('scrapeUrl').value.trim();
-  const deep = document.getElementById('scrapeDeep').checked;
-  const max_pages = parseInt(document.getElementById('scrapeMax').value || '0', 10) || null;
-  const out = document.getElementById('scrapeResult');
-  out.textContent = 'Starting…';
-  try{
-    const r = await fetch('/api/knowledge/scrape', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({url, deep, max_pages})
-    });
-    const t = await r.text();
-    out.textContent = (r.ok ? 'OK: ' : 'ERR: ') + t;
-  }catch(e){ out.textContent = 'Network error: ' + String(e); }
-  loadStats();
-}
-
-
-async function downloadKB(){
-  // Simple navigation to trigger browser download
-  window.location.href = '/api/knowledge/export_csv';
-}
-
-
-async function resolveUnknown(id){
-  const ans = prompt('Provide the answer for this question:'); if(!ans) return;
-  const r = await fetch('/api/knowledge/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({question_id:id, answer:ans})});
-  const j = await r.json(); alert(j.message || 'Resolved'); loadUnknowns(); loadStats();
-}
-async function loadUnknowns(){
-  const r = await fetch('/api/knowledge/unknown'); const j = await r.json();
-  const div = document.getElementById('unknowns');
-  if(!j.questions || !j.questions.length){ div.innerHTML = '<div class="muted">None</div>'; return; }
-  div.innerHTML = '<table><tr><th>Time</th><th>Question</th><th>Suggested</th><th></th></tr>' +
-    j.questions.map(q => '<tr><td>'+ (q.timestamp||'') +'</td><td>'+ (q.question||'') +'</td><td>'+ (q.suggested_answer||'') +'</td><td><button onclick="resolveUnknown(\\''+q.id+'\\')">Resolve</button></td></tr>').join('') +
-    '</table>';
-}
-async function loadStats(){
-  const r = await fetch('/api/stats'); const j = await r.json();
-  document.getElementById('stats').textContent = JSON.stringify(j, null, 2);
-}
-loadUnknowns(); loadStats();
-</script>
-""")
-
-# ------------------------------------------------------------------------------
-# Chat API
-# ------------------------------------------------------------------------------
-@app.post("/api/chat")
-async def api_chat(payload: Dict[str, Any]):
-    message = (payload.get("message") or "").strip()
-    history = payload.get("history") or []
-    if not message:
-        return JSONResponse({"ok": False, "error": "empty_message"}, status_code=400)
-    try:
-        lines = []
-        for h in history[-8:]:
-            role = (h.get("role") or "").strip().lower()
-            txt = limit_len((h.get("text") or "").strip(), 500)
-            if not role or not txt: continue
-            lines.append(f"{role.capitalize()}: {txt}")
-        context = "\n".join(lines)
-    except Exception:
-        context = ""
-
-    # KB first
-    answer, confidence, _ = await knowledge_manager.find_answer(message)
-    if confidence >= Config.CONFIDENCE_THRESHOLD:
-        return {"ok": True, "reply": answer, "confidence": confidence, "source": "kb"}
-
-    # Engine (may return search_link/rules/llm/AI_UNAVAILABLE_MSG)
-    reply = await ai_engine.generate_response(message, context=context)
-    source = ai_engine.last_source or "rules"
-
-    if should_record_unknown(message, reply, source, confidence):
-        uq = UnknownQuestion(
-            id=f"unknown_{uuid4().hex}",
-            question=message, call_id="chat", timestamp=now_utc(),
-            suggested_answer=reply
-        )
-        await db_manager.save_unknown_question(uq)
-
-    return {"ok": True, "reply": reply, "confidence": confidence, "source": source}
-
-# ------------------------------------------------------------------------------
-# KB + Scraper + Stats APIs
-# ------------------------------------------------------------------------------
-@app.post("/api/knowledge/add")
-async def api_add_kb(payload: Dict[str, Any]):
-    q = (payload.get("question") or "").strip()
-    a = (payload.get("answer") or "").strip()
-    url = (payload.get("url") or "").strip() or None
-    nav_path = (payload.get("nav_path") or "").strip() or None
-    tags = (payload.get("tags") or "").strip() or None
-    if not q or not a:
-        return JSONResponse({"status":"error","message":"question and answer required"}, status_code=400)
-    await knowledge_manager.add_knowledge_item(q, a, source="manual", url=url, nav_path=nav_path, tags=tags)
-    return {"status":"success","message":"Knowledge item added"}
-
-@app.post("/api/knowledge/bulk_csv")
-async def api_bulk_csv(payload: Dict[str, Any]):
-    """
-    Accepts JSON: {"csv": "<csv text>"}.
-    Columns (headered or headerless):
-      - question, answer [, source] [, url] [, nav_path] [, tags]
-    Use CSV quoting if a field contains commas: "Search path, with commas".
-    """
-    raw = (payload.get("csv") or "").strip()
-    if not raw:
-        return JSONResponse({"status": "error", "message": "csv required"}, status_code=400)
-
-    f = io.StringIO(raw)
-    reader = csv.reader(f)
-    first = next(reader, None)
-    if first is None:
-        return JSONResponse({"status": "error", "message": "empty csv"}, status_code=400)
-
-    rows = []
-    headered = any((h or "").strip().lower() in ("question","answer","source","url","nav_path","tags") for h in first)
-
-    if headered:
-        headers = [h.strip().lower() for h in first]
-        def idx(name): return headers.index(name) if name in headers else -1
-        q_idx, a_idx = idx("question"), idx("answer")
-        s_idx, u_idx, n_idx, t_idx = idx("source"), idx("url"), idx("nav_path"), idx("tags")
-        if q_idx < 0 or a_idx < 0:
-            return JSONResponse({"status":"error","message":"header must include question and answer"}, status_code=400)
-        for row in reader:
-            if not row: continue
-            try:
-                q = (row[q_idx] or "").strip()
-                a = (row[a_idx] or "").strip()
-                s = (row[s_idx] or "bulk").strip() if s_idx >= 0 and s_idx < len(row) else "bulk"
-                u = (row[u_idx] or "").strip() if u_idx >= 0 and u_idx < len(row) else None
-                n = (row[n_idx] or "").strip() if n_idx >= 0 and n_idx < len(row) else None
-                t = (row[t_idx] or "").strip() if t_idx >= 0 and t_idx < len(row) else None
-                if q and a:
-                    rows.append((q, a, s, u or None, n or None, t or None))
-            except Exception:
-                continue
-    else:
-        # Headerless: support 2..6 columns
-        if first and len(first) >= 2:
-            vals = (first + [""]*6)[:6]
-            rows.append((vals[0].strip(), vals[1].strip(), (vals[2].strip() or "bulk"),
-                         vals[3].strip() or None, vals[4].strip() or None, vals[5].strip() or None))
-        for row in reader:
-            if not row or len(row) < 2: continue
-            vals = (row + [""]*6)[:6]
-            rows.append((vals[0].strip(), vals[1].strip(), (vals[2].strip() or "bulk"),
-                         vals[3].strip() or None, vals[4].strip() or None, vals[5].strip() or None))
-
-    if not rows:
-        return {"status":"success","message":"No valid rows found.","added":0}
-
-    added, skipped = 0, 0
-    LIMIT = 5000
-    for (q, a, s, u, n, t) in rows[:LIMIT]:
-        try:
-            await knowledge_manager.add_knowledge_item(q, a, source=s or "bulk", url=u, nav_path=n, tags=t)
-            added += 1
-        except Exception:
-            skipped += 1
-
-    return {"status":"success","added":added,"skipped":skipped,"total_received":len(rows[:LIMIT])}
-
-@app.get("/debug/openai", include_in_schema=False)
-async def debug_openai():
-    try:
-        if not ai_engine.openai_client:
-            raise RuntimeError("no_openai_client (missing OPENAI_API_KEY?)")
-        resp = await run_in_threadpool(
-            ai_engine._sync_openai_chat,
-            [{"role": "system", "content": "You are a concise assistant."},
-             {"role": "user", "content": "ping"}],
-            Config.OPENAI_CHAT_MODEL, 0.2, 10
-        )
-        txt = (resp.choices[0].message.content or "").strip()
-        return {"ok": True, "model": Config.OPENAI_CHAT_MODEL, "reply": txt[:100]}
-    except Exception as e:
-        return {"ok": False, "error": repr(e)}
-
-@app.post("/api/knowledge/scrape")
-async def api_scrape(payload: Dict[str, Any]):
-    url = (payload.get("url") or "").strip()
-    deep = bool(payload.get("deep") or False)
-    max_pages = payload.get("max_pages")
-    try:
-        max_pages = int(max_pages) if max_pages else None
-    except Exception:
-        max_pages = None
-
-    if not url:
-        return JSONResponse({"status":"error","message":"url required"}, status_code=400)
-
-    try:
-        qa = await scraper.scrape(url, deep=deep, max_pages=max_pages)
-        added = 0
-        for item in qa:
-            await knowledge_manager.add_knowledge_item(
-                item["question"],
-                item["answer"],
-                source=f"scraped:{item.get('source','')}",
-                url=item.get("source")
-            )
-            added += 1
-        pages_scanned = getattr(scraper, "last_pages_scanned", 0)
-        return {
-            "status": "success",
-            "message": f"Scraped {len(qa)} items; added {added}",
-            "pages_scanned": pages_scanned,
-            "deep": deep,
-            "max_pages_effective": max_pages or Config.SCRAPE_MAX_PAGES,
-        }
-
-    except ValueError as ve:
-        return JSONResponse({"status":"error","message":str(ve)}, status_code=400)
-    except Exception:
-        logger.exception("Scrape failed")
-        return JSONResponse({"status":"error","message":"scrape_failed"}, status_code=500)
-
-@app.post("/api/knowledge/backfill_embeddings")
-async def api_backfill_embeddings():
-    items = await db_manager.get_knowledge_base()
-    updated = 0
-    for it in items:
-        if not it.embedding:
-            try:
-                it.embedding = ai_engine.get_embedding(it.question)
-                it.last_updated = now_utc()
-                await db_manager.save_knowledge_item(it)
-                updated += 1
-            except Exception as e:
-                logger.warning("Embedding backfill failed for %s: %r", it.id, e)
-    return {"status": "success", "updated": updated, "total": len(items)}
-
-
-@app.get("/api/knowledge/unknown")
-async def api_unknown():
-    qs = await db_manager.get_unknown_questions(resolved=False)
-    out = []
-    for q in qs:
-        out.append({
-            "id": q.id, "question": q.question, "call_id": q.call_id,
-            "timestamp": q.timestamp.isoformat(), "resolved": q.resolved,
-            "suggested_answer": q.suggested_answer
-        })
-    return {"questions": out}
-
-@app.post("/api/knowledge/resolve")
-async def api_resolve(payload: Dict[str, Any]):
-    qid = (payload.get("question_id") or "").strip()
-    ans = (payload.get("answer") or "").strip()
-    if not qid or not ans:
-        return JSONResponse({"status":"error","message":"question_id and answer required"}, status_code=400)
-    unknowns = await db_manager.get_unknown_questions(resolved=False)
-    target = next((u for u in unknowns if u.id == qid), None)
-    if not target:
-        return JSONResponse({"status":"error","message":"unknown_question_not_found"}, status_code=404)
-    await knowledge_manager.add_knowledge_item(target.question, ans, source="resolved")
-    async with aiosqlite.connect(Config.DATABASE_PATH) as conn:
-        await conn.execute("UPDATE unknown_questions SET resolved = 1 WHERE id = ?", (qid,))
-        await conn.commit()
-    return {"status":"success","message":"Question resolved and added to KB"}
-
-@app.get("/api/stats")
-async def api_stats():
-    stats = await db_manager.get_call_statistics()
-    return stats
-
-# ------------------------------------------------------------------------------
-# Voice WebSocket (unchanged behavior except "source" honors ai_engine.last_source)
-# ------------------------------------------------------------------------------
 @app.websocket("/ws/voice")
-async def voice_websocket(websocket: WebSocket):
+async def websocket_voice(websocket: WebSocket):
+    """Voice WebSocket endpoint."""
     await websocket.accept()
-    call_id = f"call_{uuid4().hex}"
-    if not connection_tracker.add(call_id):
-        await websocket.send_json({"type": "error", "message": "Server at capacity. Try again later."})
+    
+    session_id = str(uuid4())
+    
+    # Check connection limit
+    if not connection_manager.can_connect():
+        await websocket.send_json({
+            "type": "error",
+            "message": "Server at maximum capacity. Please try again later."
+        })
         await websocket.close(code=1013)
         return
-
-    call_created = False
+    
+    # Add connection
+    connection_manager.connect(session_id, websocket)
+    
     try:
-        call = Call(call_id=call_id, caller_info="websocket", start_time=now_utc())
-        call_created = True
-        logger.info(f"Call started: {call_id} (active={connection_tracker.count()})")
-
-        start_ts = time.monotonic()
-        client_ip = websocket.client.host if websocket.client else "unknown"
-        if not rate_limiter.is_allowed(client_ip):
-            await websocket.send_json({"type": "error", "message": "Rate limit exceeded for your IP."})
-            await websocket.close(code=1008)
-            return
-
-        audio_buffer: List[bytes] = []
-        buffer_lock = asyncio.Lock()
-        last_process_time = time.monotonic()
-
-        ESCALATE = ["human","person","agent","representative","manager","supervisor","speak to someone"]
-
+        # Create call record
+        call_id = await db_manager.create_call(session_id)
+        
+        logger.info(f"Voice session started: {session_id}")
+        
+        # Send initial status
+        await websocket.send_json({
+            "type": "connected",
+            "session_id": session_id,
+            "message": "Connected to voice agent"
+        })
+        
+        transcript = []
+        
         while True:
-            # Guard max call length
-            if time.monotonic() - start_ts > Config.MAX_CALL_DURATION:
-                await websocket.send_json({"type": "closing", "reason": "max_duration"})
-                await websocket.close(code=1000)
-                call.outcome = call.outcome or "answered"
-                break
-
-            # Receive frame
             try:
-                msg = await asyncio.wait_for(websocket.receive(), timeout=Config.WEBSOCKET_TIMEOUT)
-            except asyncio.TimeoutError:
-                await websocket.send_json({"type": "heartbeat"})
-                continue
-            except Exception:
-                break
-
-            if msg.get("type") == "websocket.disconnect":
-                break
-
-            # -----------------------------
-            # TEXT FRAMES (browser STT / control)
-            # -----------------------------
-            if "text" in msg and msg["text"] is not None:
-                try:
-                    payload = json.loads(msg["text"])
-                except Exception:
-                    payload = {"type": "text", "text": msg["text"]}
-
-                if payload.get("type") == "ping":
-                    await websocket.send_json({"type": "heartbeat"})
-                    continue
-
-                if payload.get("type") == "text":
-                    text = (payload.get("text") or "").strip()
-                    if not text:
-                        await websocket.send_json({"type": "listening"})
-                        continue
-
-                    call.transcript += f"User: {text}\n"
-
-                    # 1) KB first
-                    answer, confidence, _ = await knowledge_manager.find_answer(text)
-                    if confidence >= Config.CONFIDENCE_THRESHOLD:
-                        response_text = answer
-                        call.outcome = call.outcome or "answered"
-                        src_for_unknown = "kb"
-                    else:
-                        # Optional human escalation
-                        if any(k in text.lower() for k in ESCALATE):
-                            await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
-                            await websocket.send_json({"type": "closing", "reason": "transfer"})
-                            await websocket.close(code=1000)
-                            call.outcome = "transferred"
-                            break
-
-                        # 2) LLM/rules fallback
-                        response_text = await ai_engine.generate_response(text)
-                        src_for_unknown = ai_engine.last_source or "rules"
-
-                        # Record as unknown if gating permits
-                        if should_record_unknown(text, response_text, src_for_unknown, confidence):
-                            uq = UnknownQuestion(
-                                id=f"unknown_{uuid4().hex}",
-                                question=text,
-                                call_id=call_id,
-                                timestamp=now_utc(),
-                                suggested_answer=response_text
-                            )
-                            await db_manager.save_unknown_question(uq)
-
-                    # Always log agent reply + confidence
-                    call.transcript += f"Agent: {response_text}\n"
-                    call.confidence_score = confidence
-
-                    # TTS
-                    audio_bytes = await ai_engine.text_to_speech(response_text)
-
-                    # Source for UI
-                    if confidence >= Config.CONFIDENCE_THRESHOLD:
-                        ui_source = "kb"
-                    else:
-                        ui_source = "llm_unavailable" if response_text == AI_UNAVAILABLE_MSG else src_for_unknown
-
-                    await websocket.send_json({
-                        "type": "response",
-                        "text": response_text,
-                        "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
-                        "audio_mime": Config.AUDIO_TTS_MIME,
-                        "confidence": confidence,
-                        "source": ui_source,
-                    })
-                    continue
-
-                # Unrecognized control
-                await websocket.send_json({"type": "error", "message": "unrecognized_control_message"})
-                continue
-
-            # -----------------------------
-            # BINARY FRAMES (mic audio)
-            # -----------------------------
-            data: Optional[bytes] = msg.get("bytes")
-            if not data:
-                await websocket.send_json({"type": "noop"})
-                continue
-            if len(data) > Config.MAX_AUDIO_SIZE:
-                await websocket.send_json({"type": "error", "message": "audio_frame_too_large"})
-                continue
-
-            # Buffer + batch for STT
-            async with buffer_lock:
-                audio_buffer.append(data)
-                should_process = (
-                    len(audio_buffer) >= Config.AUDIO_BUFFER_SIZE
-                    or (time.monotonic() - last_process_time) > 2.0
+                # Receive message with timeout
+                message = await asyncio.wait_for(
+                    websocket.receive(),
+                    timeout=settings.WEBSOCKET_TIMEOUT
                 )
-                if should_process:
-                    batch = b"".join(audio_buffer)
-                    audio_buffer.clear()
-                    last_process_time = time.monotonic()
-                else:
-                    batch = None
-
-            if not batch:
-                continue
-            if len(batch) > Config.MAX_COMBINED_AUDIO:
-                await websocket.send_json({"type": "error", "message": "audio_combination_too_large"})
-                continue
-
-            # STT
-            text = await ai_engine.speech_to_text(batch)
-            if not text:
-                await websocket.send_json({"type": "listening"})
-                continue
-
-            call.transcript += f"User: {text}\n"
-
-            # 1) KB first
-            answer, confidence, _ = await knowledge_manager.find_answer(text)
-            if confidence >= Config.CONFIDENCE_THRESHOLD:
-                response_text = answer
-                call.outcome = call.outcome or "answered"
-                src_for_unknown = "kb"
-            else:
-                # Optional human escalation
-                if any(k in text.lower() for k in ESCALATE):
-                    await websocket.send_json({"type": "transfer", "message": "Transferring you to a human agent."})
-                    await websocket.send_json({"type": "closing", "reason": "transfer"})
-                    await websocket.close(code=1000)
-                    call.outcome = "transferred"
+                
+                if message.get("type") == "websocket.disconnect":
                     break
-
-                # 2) LLM/rules fallback
-                response_text = await ai_engine.generate_response(text)
-                src_for_unknown = ai_engine.last_source or "rules"
-
-                # Record as unknown if gating permits
-                if should_record_unknown(text, response_text, src_for_unknown, confidence):
-                    uq = UnknownQuestion(
-                        id=f"unknown_{uuid4().hex}",
-                        question=text,
-                        call_id=call_id,
-                        timestamp=now_utc(),
-                        suggested_answer=response_text
-                    )
-                    await db_manager.save_unknown_question(uq)
-
-            # Always log agent reply + confidence
-            call.transcript += f"Agent: {response_text}\n"
-            call.confidence_score = confidence
-
-            # TTS
-            audio_bytes = await ai_engine.text_to_speech(response_text)
-
-            # Source for UI
-            if confidence >= Config.CONFIDENCE_THRESHOLD:
-                ui_source = "kb"
-            else:
-                ui_source = "llm_unavailable" if response_text == AI_UNAVAILABLE_MSG else src_for_unknown
-
-            await websocket.send_json({
-                "type": "response",
-                "text": response_text,
-                "audio_b64": base64.b64encode(audio_bytes).decode() if audio_bytes else "",
-                "audio_mime": Config.AUDIO_TTS_MIME,
-                "confidence": confidence,
-                "source": ui_source,
-            })
-
-    except WebSocketDisconnect:
-        logger.info(f"Call disconnected: {call_id}")
-    except Exception as e:
-        logger.error(f"WebSocket error ({call_id}): {e}")
-        try:
-            await websocket.send_json({"type": "error", "message": "internal_error"})
-        except Exception:
-            pass
-    finally:
-        connection_tracker.remove(call_id)
-        if call_created:
-            try:
-                call.end_time = now_utc()
-                await db_manager.save_call(call)
+                
+                # Handle text messages (from browser speech recognition or text input)
+                if "text" in message and message["text"]:
+                    try:
+                        data = json.loads(message["text"])
+                        
+                        if data.get("type") == "text" and data.get("text"):
+                            user_message = data["text"].strip()
+                            
+                            if user_message:
+                                transcript.append(f"User: {user_message}")
+                                
+                                # Check for human transfer request
+                                if any(phrase in user_message.lower() for phrase in 
+                                      ['human', 'person', 'agent', 'representative', 'speak to someone']):
+                                    await websocket.send_json({
+                                        "type": "transfer",
+                                        "message": "I'll connect you with a human agent right away."
+                                    })
+                                    
+                                    await db_manager.update_call(call_id, 
+                                                               status=CallStatus.TRANSFERRED.value,
+                                                               transcript="\n".join(transcript))
+                                    break
+                                
+                                # Find answer in knowledge base
+                                answer, confidence, item_id = await knowledge_manager.find_answer(user_message)
+                                
+                                if confidence >= settings.SIMILARITY_THRESHOLD:
+                                    response_text = answer
+                                    source = "knowledge_base"
+                                else:
+                                    # Generate AI response
+                                    context = [ChatMessage(role=MessageRole.USER, content=user_message)]
+                                    response_text = await ai_engine.generate_response(user_message, context)
+                                    source = "ai_assistant"
+                                    
+                                    # Record as unknown question
+                                    unknown = UnknownQuestion(
+                                        call_id=call_id,
+                                        question=user_message,
+                                        suggested_answer=response_text
+                                    )
+                                    await db_manager.add_unknown_question(unknown)
+                                
+                                transcript.append(f"Assistant: {response_text}")
+                                
+                                # Generate speech
+                                audio_data = await ai_engine.text_to_speech(response_text)
+                                
+                                # Send response
+                                response = {
+                                    "type": "response",
+                                    "text": response_text,
+                                    "confidence": confidence,
+                                    "source": source,
+                                    "session_id": session_id
+                                }
+                                
+                                if audio_data:
+                                    response["audio_b64"] = base64.b64encode(audio_data).decode()
+                                    response["audio_mime"] = "audio/mpeg"
+                                
+                                await websocket.send_json(response)
+                        
+                        elif data.get("type") == "ping":
+                            await websocket.send_json({"type": "pong"})
+                    
+                    except json.JSONDecodeError:
+                        # Treat as plain text
+                        user_message = message["text"].strip()
+                        if user_message:
+                            # Same processing as above but simpler
+                            response_text = await ai_engine.generate_response(user_message)
+                            await websocket.send_json({
+                                "type": "response",
+                                "text": response_text,
+                                "confidence": 0.5,
+                                "source": "ai_assistant",
+                                "session_id": session_id
+                            })
+                
+                # Handle binary messages (audio data)
+                elif "bytes" in message:
+                    audio_data = message["bytes"]
+                    
+                    if len(audio_data) > settings.MAX_AUDIO_SIZE:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Audio data too large"
+                        })
+                        continue
+                    
+                    # Convert speech to text
+                    await websocket.send_json({
+                        "type": "processing",
+                        "message": "Processing speech..."
+                    })
+                    
+                    user_message = await ai_engine.speech_to_text(audio_data)
+                    
+                    if user_message:
+                        transcript.append(f"User: {user_message}")
+                        
+                        # Process the same way as text messages
+                        answer, confidence, item_id = await knowledge_manager.find_answer(user_message)
+                        
+                        if confidence >= settings.SIMILARITY_THRESHOLD:
+                            response_text = answer
+                            source = "knowledge_base"
+                        else:
+                            response_text = await ai_engine.generate_response(user_message)
+                            source = "ai_assistant"
+                        
+                        transcript.append(f"Assistant: {response_text}")
+                        
+                        # Generate speech response
+                        audio_response = await ai_engine.text_to_speech(response_text)
+                        
+                        response = {
+                            "type": "response",
+                            "text": response_text,
+                            "user_text": user_message,
+                            "confidence": confidence,
+                            "source": source,
+                            "session_id": session_id
+                        }
+                        
+                        if audio_response:
+                            response["audio_b64"] = base64.b64encode(audio_response).decode()
+                            response["audio_mime"] = "audio/mpeg"
+                        
+                        await websocket.send_json(response)
+                    else:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Could not process speech. Please try again."
+                        })
+                
+            except asyncio.TimeoutError:
+                # Send heartbeat
+                await websocket.send_json({
+                    "type": "heartbeat",
+                    "timestamp": datetime.utcnow().isoformat()
+                })
+            
             except Exception as e:
-                logger.error(f"Failed to persist call {call_id}: {e}")
-        logger.info(f"Call ended: {call_id} (active={connection_tracker.count()})")
+                logger.error(f"WebSocket message error: {e}")
+                await websocket.send_json({
+                    "type": "error", 
+                    "message": "An error occurred processing your request"
+                })
+    
+    except WebSocketDisconnect:
+        logger.info(f"WebSocket disconnected: {session_id}")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        logger.error(traceback.format_exc())
+    finally:
+        connection_manager.disconnect(session_id)
+        
+        # Update call record
+        try:
+            await db_manager.update_call(call_id,
+                                       status=CallStatus.COMPLETED.value,
+                                       transcript="\n".join(transcript) if 'transcript' in locals() else "")
+        except Exception as e:
+            logger.error(f"Error updating call record: {e}")
+        
+        logger.info(f"Voice session ended: {session_id}")
 
+# ==============================================================================
+# HTTP API Endpoints
+# ==============================================================================
 
-# ------------------------------------------------------------------------------
-# Health
-# ------------------------------------------------------------------------------
-@app.get("/health")
-async def health():
-    stats = await db_manager.get_call_statistics()
+@app.get("/")
+async def get_index():
+    """Serve the main application interface."""
+    return HTMLResponse(content="""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Voice Agent</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 800px;
+            width: 100%;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        
+        .header h1 {
+            color: white;
+            font-size: 3rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .header p {
+            color: rgba(255,255,255,0.9);
+            font-size: 1.2rem;
+        }
+        
+        .main-card {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .voice-interface {
+            text-align: center;
+        }
+        
+        .microphone-button {
+            width: 150px;
+            height: 150px;
+            border-radius: 50%;
+            border: none;
+            background: linear-gradient(45deg, #ff6b6b, #ee5a52);
+            color: white;
+            font-size: 3rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 10px 30px rgba(238, 90, 82, 0.3);
+            margin: 20px auto;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .microphone-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 15px 40px rgba(238, 90, 82, 0.4);
+        }
+        
+        .microphone-button.active {
+            background: linear-gradient(45deg, #51cf66, #40c057);
+            animation: pulse 2s infinite;
+        }
+        
+        .microphone-button.disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        
+        .status {
+            margin: 20px 0;
+            padding: 15px;
+            border-radius: 10px;
+            font-weight: 500;
+            min-height: 50px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .status.disconnected {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ffcdd2;
+        }
+        
+        .status.connected {
+            background: #e3f2fd;
+            color: #1976d2;
+            border: 1px solid #bbdefb;
+        }
+        
+        .status.listening {
+            background: #f3e5f5;
+            color: #7b1fa2;
+            border: 1px solid #e1bee7;
+        }
+        
+        .status.processing {
+            background: #fff3e0;
+            color: #f57c00;
+            border: 1px solid #ffcc02;
+        }
+        
+        .status.error {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ffcdd2;
+        }
+        
+        .transcript {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 20px;
+            margin: 20px 0;
+            min-height: 300px;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #e9ecef;
+            text-align: left;
+        }
+        
+        .message {
+            margin: 15px 0;
+            padding: 12px 16px;
+            border-radius: 12px;
+            max-width: 85%;
+            word-wrap: break-word;
+        }
+        
+        .message.user {
+            background: #e3f2fd;
+            margin-left: auto;
+            text-align: right;
+        }
+        
+        .message.assistant {
+            background: #e8f5e8;
+            margin-right: auto;
+        }
+        
+        .message .label {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        
+        .message .confidence {
+            font-size: 0.8rem;
+            opacity: 0.7;
+            margin-top: 5px;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 1rem;
+        }
+        
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+        
+        .btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+            text-align: center;
+        }
+        
+        .stat {
+            background: rgba(102, 126, 234, 0.1);
+            padding: 15px;
+            border-radius: 10px;
+            border: 1px solid rgba(102, 126, 234, 0.2);
+        }
+        
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .stat-label {
+            font-size: 0.9rem;
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .admin-link {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(255,255,255,0.2);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 20px;
+            text-decoration: none;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.3);
+            transition: all 0.3s ease;
+        }
+        
+        .admin-link:hover {
+            background: rgba(255,255,255,0.3);
+            transform: translateY(-2px);
+        }
+        
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .microphone-button {
+                width: 120px;
+                height: 120px;
+                font-size: 2rem;
+            }
+            
+            .main-card {
+                padding: 20px;
+            }
+        }
+        
+        .hidden {
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <a href="/admin" class="admin-link">Admin Panel</a>
+    
+    <div class="container">
+        <div class="header">
+            <h1>🎤 AI Voice Agent</h1>
+            <p>Advanced AI-powered customer service system</p>
+        </div>
+        
+        <div class="main-card">
+            <div class="voice-interface">
+                <div id="status" class="status disconnected">
+                    Click Connect to start
+                </div>
+                
+                <button id="micButton" class="microphone-button disabled" disabled>
+                    🎤
+                </button>
+                
+                <div class="transcript" id="transcript">
+                    <div style="text-align: center; color: #666; margin-top: 100px;">
+                        Your conversation will appear here...
+                    </div>
+                </div>
+                
+                <div class="controls">
+                    <button id="connectBtn" class="btn btn-primary">Connect</button>
+                    <button id="disconnectBtn" class="btn btn-danger" disabled>Disconnect</button>
+                    <button id="clearBtn" class="btn btn-secondary">Clear Chat</button>
+                </div>
+                
+                <div class="stats" id="stats">
+                    <div class="stat">
+                        <div class="stat-value" id="activeConnections">-</div>
+                        <div class="stat-label">Active Connections</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="totalCalls">-</div>
+                        <div class="stat-label">Total Calls</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-value" id="knowledgeItems">-</div>
+                        <div class="stat-label">Knowledge Items</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        class VoiceAgent {
+            constructor() {
+                this.websocket = null;
+                this.isConnected = false;
+                this.isListening = false;
+                this.mediaRecorder = null;
+                this.audioChunks = [];
+                this.sessionId = null;
+                
+                this.initializeElements();
+                this.bindEvents();
+                this.loadStats();
+                
+                // Auto-refresh stats every 30 seconds
+                setInterval(() => this.loadStats(), 30000);
+            }
+            
+            initializeElements() {
+                this.elements = {
+                    status: document.getElementById('status'),
+                    micButton: document.getElementById('micButton'),
+                    connectBtn: document.getElementById('connectBtn'),
+                    disconnectBtn: document.getElementById('disconnectBtn'),
+                    clearBtn: document.getElementById('clearBtn'),
+                    transcript: document.getElementById('transcript'),
+                    activeConnections: document.getElementById('activeConnections'),
+                    totalCalls: document.getElementById('totalCalls'),
+                    knowledgeItems: document.getElementById('knowledgeItems')
+                };
+            }
+            
+            bindEvents() {
+                this.elements.connectBtn.addEventListener('click', () => this.connect());
+                this.elements.disconnectBtn.addEventListener('click', () => this.disconnect());
+                this.elements.micButton.addEventListener('click', () => this.toggleRecording());
+                this.elements.clearBtn.addEventListener('click', () => this.clearTranscript());
+            }
+            
+            async connect() {
+                if (this.isConnected) return;
+                
+                try {
+                    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const wsUrl = `${protocol}//${window.location.host}/ws/voice`;
+                    
+                    this.websocket = new WebSocket(wsUrl);
+                    
+                    this.websocket.onopen = () => {
+                        this.isConnected = true;
+                        this.updateStatus('Connected', 'connected');
+                        this.updateButtons();
+                    };
+                    
+                    this.websocket.onmessage = (event) => {
+                        this.handleMessage(JSON.parse(event.data));
+                    };
+                    
+                    this.websocket.onclose = () => {
+                        this.isConnected = false;
+                        this.isListening = false;
+                        this.updateStatus('Disconnected', 'disconnected');
+                        this.updateButtons();
+                        if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+                            this.mediaRecorder.stop();
+                        }
+                    };
+                    
+                    this.websocket.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.updateStatus('Connection error', 'error');
+                    };
+                    
+                } catch (error) {
+                    console.error('Connection error:', error);
+                    this.updateStatus('Failed to connect', 'error');
+                }
+            }
+            
+            disconnect() {
+                if (this.websocket) {
+                    this.websocket.close();
+                }
+                
+                if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+                    this.mediaRecorder.stop();
+                }
+            }
+            
+            async toggleRecording() {
+                if (!this.isConnected) {
+                    alert('Please connect first');
+                    return;
+                }
+                
+                if (this.isListening) {
+                    this.stopRecording();
+                } else {
+                    await this.startRecording();
+                }
+            }
+            
+            async startRecording() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            sampleRate: 16000,
+                            channelCount: 1,
+                            echoCancellation: true,
+                            noiseSuppression: true
+                        }
+                    });
+                    
+                    this.mediaRecorder = new MediaRecorder(stream, {
+                        mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus') 
+                            ? 'audio/webm;codecs=opus' 
+                            : 'audio/webm'
+                    });
+                    
+                    this.audioChunks = [];
+                    
+                    this.mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            this.audioChunks.push(event.data);
+                        }
+                    };
+                    
+                    this.mediaRecorder.onstop = () => {
+                        const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' });
+                        this.sendAudioData(audioBlob);
+                        
+                        // Clean up stream
+                        stream.getTracks().forEach(track => track.stop());
+                    };
+                    
+                    this.mediaRecorder.start();
+                    this.isListening = true;
+                    this.updateStatus('Listening... (Click to stop)', 'listening');
+                    this.updateButtons();
+                    
+                    // Auto-stop after 10 seconds
+                    setTimeout(() => {
+                        if (this.isListening) {
+                            this.stopRecording();
+                        }
+                    }, 10000);
+                    
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                    this.updateStatus('Microphone access denied', 'error');
+                    alert('Please allow microphone access and try again.');
+                }
+            }
+            
+            stopRecording() {
+                if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+                    this.mediaRecorder.stop();
+                    this.isListening = false;
+                    this.updateStatus('Processing...', 'processing');
+                    this.updateButtons();
+                }
+            }
+            
+            async sendAudioData(audioBlob) {
+                if (!this.isConnected || !this.websocket) return;
+                
+                try {
+                    const arrayBuffer = await audioBlob.arrayBuffer();
+                    this.websocket.send(arrayBuffer);
+                } catch (error) {
+                    console.error('Error sending audio:', error);
+                    this.updateStatus('Error sending audio', 'error');
+                }
+            }
+            
+            handleMessage(data) {
+                console.log('Received message:', data);
+                
+                switch (data.type) {
+                    case 'connected':
+                        this.sessionId = data.session_id;
+                        this.updateStatus('Connected - Ready to chat!', 'connected');
+                        break;
+                        
+                    case 'response':
+                        this.addMessage('assistant', data.text, data.confidence, data.source);
+                        if (data.user_text) {
+                            this.addMessage('user', data.user_text);
+                        }
+                        this.updateStatus('Connected - Ready to chat!', 'connected');
+                        
+                        // Play audio response if available
+                        if (data.audio_b64 && data.audio_mime) {
+                            this.playAudio(data.audio_b64, data.audio_mime);
+                        }
+                        break;
+                        
+                    case 'processing':
+                        this.updateStatus(data.message || 'Processing...', 'processing');
+                        break;
+                        
+                    case 'transfer':
+                        this.updateStatus('Transferring to human agent...', 'processing');
+                        this.addMessage('system', data.message);
+                        setTimeout(() => {
+                            this.disconnect();
+                        }, 2000);
+                        break;
+                        
+                    case 'error':
+                        this.updateStatus(data.message || 'Error occurred', 'error');
+                        break;
+                        
+                    case 'heartbeat':
+                        // Keep connection alive
+                        break;
+                        
+                    default:
+                        console.log('Unknown message type:', data.type);
+                }
+            }
+            
+            addMessage(sender, text, confidence = null, source = null) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${sender}`;
+                
+                let content = `<div class="label">${sender === 'user' ? 'You' : sender === 'assistant' ? 'Assistant' : 'System'}:</div>`;
+                content += `<div>${text}</div>`;
+                
+                if (confidence !== null && sender === 'assistant') {
+                    content += `<div class="confidence">Confidence: ${(confidence * 100).toFixed(1)}% | Source: ${source || 'unknown'}</div>`;
+                }
+                
+                messageDiv.innerHTML = content;
+                this.elements.transcript.appendChild(messageDiv);
+                this.elements.transcript.scrollTop = this.elements.transcript.scrollHeight;
+            }
+            
+            playAudio(audioB64, mimeType) {
+                try {
+                    const audio = new Audio(`data:${mimeType};base64,${audioB64}`);
+                    audio.play().catch(e => console.error('Error playing audio:', e));
+                } catch (error) {
+                    console.error('Error creating audio:', error);
+                }
+            }
+            
+            updateStatus(message, className) {
+                this.elements.status.textContent = message;
+                this.elements.status.className = `status ${className}`;
+            }
+            
+            updateButtons() {
+                // Connect button
+                this.elements.connectBtn.disabled = this.isConnected;
+                this.elements.connectBtn.textContent = this.isConnected ? 'Connected' : 'Connect';
+                
+                // Disconnect button
+                this.elements.disconnectBtn.disabled = !this.isConnected;
+                
+                // Microphone button
+                this.elements.micButton.disabled = !this.isConnected;
+                this.elements.micButton.className = `microphone-button ${
+                    !this.isConnected ? 'disabled' : this.isListening ? 'active' : ''
+                }`;
+                this.elements.micButton.textContent = this.isListening ? '⏹️' : '🎤';
+            }
+            
+            clearTranscript() {
+                this.elements.transcript.innerHTML = `
+                    <div style="text-align: center; color: #666; margin-top: 100px;">
+                        Your conversation will appear here...
+                    </div>
+                `;
+            }
+            
+            async loadStats() {
+                try {
+                    const response = await fetch('/api/stats');
+                    const stats = await response.json();
+                    
+                    this.elements.activeConnections.textContent = stats.active_calls || 0;
+                    this.elements.totalCalls.textContent = stats.total_calls || 0;
+                    this.elements.knowledgeItems.textContent = stats.knowledge_items || 0;
+                } catch (error) {
+                    console.error('Error loading stats:', error);
+                }
+            }
+        }
+        
+        // Initialize the voice agent when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new VoiceAgent();
+        });
+    </script>
+</body>
+</html>
+    """)
+
+@app.get("/admin")
+async def get_admin():
+    """Admin panel interface."""
+    return HTMLResponse(content="""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Panel - AI Voice Agent</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        .header {
+            background: #667eea;
+            color: white;
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .header h1 {
+            font-size: 1.5rem;
+        }
+        
+        .back-link {
+            color: white;
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border: 1px solid white;
+            border-radius: 4px;
+            transition: background 0.3s;
+        }
+        
+        .back-link:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .card h2 {
+            margin-bottom: 1rem;
+            color: #667eea;
+            border-bottom: 2px solid #667eea;
+            padding-bottom: 0.5rem;
+        }
+        
+        .form-group {
+            margin-bottom: 1rem;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+        
+        input, textarea, select {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 1rem;
+        }
+        
+        textarea {
+            resize: vertical;
+            min-height: 100px;
+        }
+        
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background 0.3s;
+        }
+        
+        .btn:hover {
+            background: #5a6fd8;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+        }
+        
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+        
+        .btn-danger {
+            background: #dc3545;
+        }
+        
+        .btn-danger:hover {
+            background: #c82333;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 8px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            margin-bottom: 0.5rem;
+        }
+        
+        .stat-label {
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+        
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+        
+        .table th,
+        .table td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .table th {
+            background: #f8f9fa;
+            font-weight: 600;
+        }
+        
+        .table tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .message {
+            padding: 1rem;
+            margin: 1rem 0;
+            border-radius: 4px;
+        }
+        
+        .message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .loading {
+            text-align: center;
+            color: #666;
+            font-style: italic;
+        }
+        
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 0 1rem;
+            }
+            
+            .grid-2 {
+                grid-template-columns: 1fr;
+            }
+            
+            .header {
+                padding: 1rem;
+            }
+            
+            .header h1 {
+                font-size: 1.2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Admin Panel</h1>
+        <a href="/" class="back-link">← Back to Voice Agent</a>
+    </div>
+    
+    <div class="container">
+        <!-- Statistics -->
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card">
+                <div class="stat-value" id="totalCalls">-</div>
+                <div class="stat-label">Total Calls</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="activeCalls">-</div>
+                <div class="stat-label">Active Calls</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="knowledgeItems">-</div>
+                <div class="stat-label">Knowledge Items</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="unknownQuestions">-</div>
+                <div class="stat-label">Unknown Questions</div>
+            </div>
+        </div>
+        
+        <div class="grid-2">
+            <!-- Add Knowledge Item -->
+            <div class="card">
+                <h2>Add Knowledge Item</h2>
+                <form id="addKnowledgeForm">
+                    <div class="form-group">
+                        <label for="question">Question:</label>
+                        <input type="text" id="question" name="question" required maxlength="2000" 
+                               placeholder="Enter the question customers might ask...">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="answer">Answer:</label>
+                        <textarea id="answer" name="answer" required maxlength="5000" 
+                                  placeholder="Enter the response the AI should provide..."></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="category">Category (optional):</label>
+                        <input type="text" id="category" name="category" maxlength="100" 
+                               placeholder="e.g., technical, billing, general">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="source">Source (optional):</label>
+                        <input type="text" id="source" name="source" maxlength="255" 
+                               placeholder="e.g., manual, imported, training">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="confidence">Confidence Threshold:</label>
+                        <input type="number" id="confidence" name="confidence" 
+                               min="0" max="1" step="0.1" value="0.75">
+                    </div>
+                    
+                    <button type="submit" class="btn">Add Knowledge Item</button>
+                </form>
+                
+                <div id="addMessage"></div>
+            </div>
+            
+            <!-- Bulk Import -->
+            <div class="card">
+                <h2>Bulk Import (CSV)</h2>
+                <p style="margin-bottom: 1rem; color: #666; font-size: 0.9rem;">
+                    Upload a CSV file with columns: question, answer, category, source<br>
+                    First row should contain headers.
+                </p>
+                
+                <div class="form-group">
+                    <label for="csvFile">Select CSV File:</label>
+                    <input type="file" id="csvFile" accept=".csv" />
+                </div>
+                
+                <button id="importBtn" class="btn">Import CSV</button>
+                
+                <div id="importMessage"></div>
+            </div>
+        </div>
+        
+        <!-- Unknown Questions -->
+        <div class="card">
+            <h2>Unknown Questions</h2>
+            <p style="margin-bottom: 1rem; color: #666;">
+                Questions that couldn't be answered from the knowledge base.
+            </p>
+            
+            <div id="unknownQuestionsContainer">
+                <div class="loading">Loading unknown questions...</div>
+            </div>
+        </div>
+        
+        <!-- Knowledge Base Items -->
+        <div class="card">
+            <h2>Knowledge Base Items</h2>
+            <p style="margin-bottom: 1rem; color: #666;">
+                Current knowledge base items ordered by usage count.
+            </p>
+            
+            <div id="knowledgeItemsContainer">
+                <div class="loading">Loading knowledge items...</div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        class AdminPanel {
+            constructor() {
+                this.bindEvents();
+                this.loadStats();
+                this.loadUnknownQuestions();
+                this.loadKnowledgeItems();
+                
+                // Auto-refresh every 30 seconds
+                setInterval(() => {
+                    this.loadStats();
+                    this.loadUnknownQuestions();
+                }, 30000);
+            }
+            
+            bindEvents() {
+                // Add knowledge form
+                document.getElementById('addKnowledgeForm').addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    this.addKnowledgeItem();
+                });
+                
+                // CSV import
+                document.getElementById('importBtn').addEventListener('click', () => {
+                    this.importCSV();
+                });
+            }
+            
+            async loadStats() {
+                try {
+                    const response = await fetch('/api/stats');
+                    const stats = await response.json();
+                    
+                    document.getElementById('totalCalls').textContent = stats.total_calls || 0;
+                    document.getElementById('activeCalls').textContent = stats.active_calls || 0;
+                    document.getElementById('knowledgeItems').textContent = stats.knowledge_items || 0;
+                    document.getElementById('unknownQuestions').textContent = stats.unknown_questions || 0;
+                } catch (error) {
+                    console.error('Error loading stats:', error);
+                }
+            }
+            
+            async addKnowledgeItem() {
+                const formData = new FormData(document.getElementById('addKnowledgeForm'));
+                const data = {
+                    question: formData.get('question').trim(),
+                    answer: formData.get('answer').trim(),
+                    category: formData.get('category').trim() || null,
+                    source: formData.get('source').trim() || null,
+                    confidence_threshold: parseFloat(formData.get('confidence'))
+                };
+                
+                if (!data.question || !data.answer) {
+                    this.showMessage('addMessage', 'Question and answer are required', 'error');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/api/knowledge/add', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(data)
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (response.ok) {
+                        this.showMessage('addMessage', 'Knowledge item added successfully!', 'success');
+                        document.getElementById('addKnowledgeForm').reset();
+                        document.getElementById('confidence').value = '0.75';
+                        this.loadStats();
+                        this.loadKnowledgeItems();
+                    } else {
+                        this.showMessage('addMessage', result.detail || 'Error adding knowledge item', 'error');
+                    }
+                } catch (error) {
+                    console.error('Error adding knowledge item:', error);
+                    this.showMessage('addMessage', 'Network error occurred', 'error');
+                }
+            }
+            
+            async importCSV() {
+                const fileInput = document.getElementById('csvFile');
+                const file = fileInput.files[0];
+                
+                if (!file) {
+                    this.showMessage('importMessage', 'Please select a CSV file', 'error');
+                    return;
+                }
+                
+                const text = await file.text();
+                
+                try {
+                    const response = await fetch('/api/knowledge/bulk', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ csv_data: text })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (response.ok) {
+                        this.showMessage('importMessage', 
+                            `Successfully imported ${result.added || 0} items`, 'success');
+                        fileInput.value = '';
+                        this.loadStats();
+                        this.loadKnowledgeItems();
+                    } else {
+                        this.showMessage('importMessage', result.detail || 'Import failed', 'error');
+                    }
+                } catch (error) {
+                    console.error('Error importing CSV:', error);
+                    this.showMessage('importMessage', 'Network error occurred', 'error');
+                }
+            }
+            
+            async loadUnknownQuestions() {
+                try {
+                    const response = await fetch('/api/knowledge/unknown');
+                    const questions = await response.json();
+                    
+                    const container = document.getElementById('unknownQuestionsContainer');
+                    
+                    if (!questions.length) {
+                        container.innerHTML = '<p>No unknown questions at this time.</p>';
+                        return;
+                    }
+                    
+                    let html = '<table class="table"><thead><tr><th>Question</th><th>Suggested Answer</th><th>Created</th><th>Actions</th></tr></thead><tbody>';
+                    
+                    questions.forEach(q => {
+                        const createdDate = q.created_at ? new Date(q.created_at).toLocaleString() : 'Unknown';
+                        html += `
+                            <tr>
+                                <td style="max-width: 300px; word-wrap: break-word;">${this.escapeHtml(q.question)}</td>
+                                <td style="max-width: 300px; word-wrap: break-word;">${this.escapeHtml(q.suggested_answer || 'No suggestion')}</td>
+                                <td>${createdDate}</td>
+                                <td>
+                                    <button class="btn btn-secondary" onclick="adminPanel.resolveQuestion('${q.id}', '${this.escapeHtml(q.question)}')">
+                                        Resolve
+                                    </button>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                    
+                    html += '</tbody></table>';
+                    container.innerHTML = html;
+                    
+                } catch (error) {
+                    console.error('Error loading unknown questions:', error);
+                    document.getElementById('unknownQuestionsContainer').innerHTML = 
+                        '<p class="error">Error loading unknown questions</p>';
+                }
+            }
+            
+            async loadKnowledgeItems() {
+                try {
+                    const response = await fetch('/api/knowledge/items');
+                    const items = await response.json();
+                    
+                    const container = document.getElementById('knowledgeItemsContainer');
+                    
+                    if (!items.length) {
+                        container.innerHTML = '<p>No knowledge items found.</p>';
+                        return;
+                    }
+                    
+                    let html = '<table class="table"><thead><tr><th>Question</th><th>Answer</th><th>Category</th><th>Usage</th><th>Actions</th></tr></thead><tbody>';
+                    
+                    items.slice(0, 50).forEach(item => {  // Show first 50 items
+                        html += `
+                            <tr>
+                                <td style="max-width: 250px; word-wrap: break-word;">${this.escapeHtml(item.question)}</td>
+                                <td style="max-width: 300px; word-wrap: break-word;">${this.escapeHtml(item.answer)}</td>
+                                <td>${this.escapeHtml(item.category || 'General')}</td>
+                                <td>${item.usage_count}</td>
+                                <td>
+                                    <button class="btn btn-danger btn-sm" onclick="adminPanel.deleteItem('${item.id}')">
+                                        Delete
+                                    </button>
+                                </td>
+                            </tr>
+                        `;
+                    });
+                    
+                    html += '</tbody></table>';
+                    
+                    if (items.length > 50) {
+                        html += `<p style="margin-top: 1rem; color: #666;">Showing first 50 of ${items.length} items</p>`;
+                    }
+                    
+                    container.innerHTML = html;
+                    
+                } catch (error) {
+                    console.error('Error loading knowledge items:', error);
+                    document.getElementById('knowledgeItemsContainer').innerHTML = 
+                        '<p class="error">Error loading knowledge items</p>';
+                }
+            }
+            
+            async resolveQuestion(questionId, questionText) {
+                const answer = prompt(`Please provide an answer for:\n\n"${questionText}"`);
+                
+                if (!answer) return;
+                
+                try {
+                    const response = await fetch('/api/knowledge/resolve', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            question_id: questionId,
+                            answer: answer
+                        })
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (response.ok) {
+                        alert('Question resolved and added to knowledge base!');
+                        this.loadStats();
+                        this.loadUnknownQuestions();
+                        this.loadKnowledgeItems();
+                    } else {
+                        alert(result.detail || 'Error resolving question');
+                    }
+                } catch (error) {
+                    console.error('Error resolving question:', error);
+                    alert('Network error occurred');
+                }
+            }
+            
+            async deleteItem(itemId) {
+                if (!confirm('Are you sure you want to delete this knowledge item?')) {
+                    return;
+                }
+                
+                try {
+                    const response = await fetch(`/api/knowledge/items/${itemId}`, {
+                        method: 'DELETE'
+                    });
+                    
+                    if (response.ok) {
+                        alert('Knowledge item deleted!');
+                        this.loadStats();
+                        this.loadKnowledgeItems();
+                    } else {
+                        alert('Error deleting item');
+                    }
+                } catch (error) {
+                    console.error('Error deleting item:', error);
+                    alert('Network error occurred');
+                }
+            }
+            
+            showMessage(containerId, message, type) {
+                const container = document.getElementById(containerId);
+                container.innerHTML = `<div class="message ${type}">${message}</div>`;
+                
+                // Clear message after 5 seconds
+                setTimeout(() => {
+                    container.innerHTML = '';
+                }, 5000);
+            }
+            
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text || '';
+                return div.innerHTML;
+            }
+        }
+        
+        // Initialize admin panel
+        const adminPanel = new AdminPanel();
+    </script>
+</body>
+</html>
+    """)
+
+@app.post("/api/chat")
+async def api_chat(request: ChatRequest):
+    """Chat API endpoint."""
+    try:
+        # Check rate limiting
+        client_ip = "default"  # Could get from request headers
+        if not rate_limiter.is_allowed(client_ip):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        
+        # Generate response
+        context = []  # Could build from request history
+        answer, confidence, item_id = await knowledge_manager.find_answer(request.message)
+        
+        if confidence >= settings.SIMILARITY_THRESHOLD:
+            response_text = answer
+            source = "knowledge_base"
+        else:
+            response_text = await ai_engine.generate_response(request.message, context)
+            source = "ai_assistant"
+        
+        return ChatResponse(
+            message=response_text,
+            confidence=confidence,
+            source=source,
+            session_id=request.session_id or str(uuid4())
+        )
+        
+    except Exception as e:
+        logger.error(f"Chat API error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/api/knowledge/add")
+async def api_add_knowledge(item: KnowledgeItem):
+    """Add knowledge base item."""
+    try:
+        item_id = await knowledge_manager.add_item(item)
+        return BaseResponse(
+            success=True,
+            message="Knowledge item added successfully",
+            data={"id": item_id}
+        )
+    except Exception as e:
+        logger.error(f"Add knowledge error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/knowledge/bulk")
+async def api_bulk_import(data: Dict[str, str]):
+    """Bulk import knowledge items from CSV."""
+    try:
+        csv_data = data.get("csv_data", "")
+        if not csv_data:
+            raise HTTPException(status_code=400, detail="No CSV data provided")
+        
+        # Simple CSV parsing (could use csv module for production)
+        lines = csv_data.strip().split('\n')
+        if len(lines) < 2:
+            raise HTTPException(status_code=400, detail="CSV must have header and at least one data row")
+        
+        header = lines[0].split(',')
+        added = 0
+        
+        for line in lines[1:]:
+            try:
+                values = line.split(',')
+                if len(values) >= 2:
+                    item = KnowledgeItem(
+                        question=values[0].strip().strip('"'),
+                        answer=values[1].strip().strip('"'),
+                        category=values[2].strip().strip('"') if len(values) > 2 else None,
+                        source=values[3].strip().strip('"') if len(values) > 3 else "bulk_import"
+                    )
+                    await knowledge_manager.add_item(item)
+                    added += 1
+            except Exception as e:
+                logger.warning(f"Error processing CSV line: {line[:100]}, error: {e}")
+                continue
+        
+        return BaseResponse(
+            success=True,
+            message=f"Successfully imported {added} items",
+            data={"added": added}
+        )
+        
+    except Exception as e:
+        logger.error(f"Bulk import error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/knowledge/items")
+async def api_get_knowledge_items():
+    """Get all knowledge base items."""
+    try:
+        items = await db_manager.get_knowledge_items()
+        return [item.dict() for item in items]
+    except Exception as e:
+        logger.error(f"Get knowledge items error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/knowledge/items/{item_id}")
+async def api_delete_knowledge_item(item_id: str):
+    """Delete knowledge base item."""
+    try:
+        # Simple implementation - set inactive
+        async with aiosqlite.connect(settings.DATABASE_PATH) as db:
+            await db.execute("UPDATE knowledge_items SET active = 0 WHERE id = ?", (item_id,))
+            await db.commit()
+        
+        return BaseResponse(success=True, message="Item deleted successfully")
+    except Exception as e:
+        logger.error(f"Delete knowledge item error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/knowledge/unknown")
+async def api_get_unknown_questions():
+    """Get unknown questions."""
+    try:
+        questions = await db_manager.get_unknown_questions(resolved=False, limit=50)
+        return [q.dict() for q in questions]
+    except Exception as e:
+        logger.error(f"Get unknown questions error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/knowledge/resolve")
+async def api_resolve_question(data: Dict[str, str]):
+    """Resolve unknown question by adding to knowledge base."""
+    try:
+        question_id = data.get("question_id")
+        answer = data.get("answer")
+        
+        if not question_id or not answer:
+            raise HTTPException(status_code=400, detail="Question ID and answer required")
+        
+        # Get the question
+        async with aiosqlite.connect(settings.DATABASE_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM unknown_questions WHERE id = ?", (question_id,)) as cursor:
+                row = await cursor.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Question not found")
+        
+        # Add to knowledge base
+        item = KnowledgeItem(
+            question=row['question'],
+            answer=answer.strip(),
+            source="resolved"
+        )
+        await knowledge_manager.add_item(item)
+        
+        # Mark as resolved
+        async with aiosqlite.connect(settings.DATABASE_PATH) as db:
+            await db.execute("UPDATE unknown_questions SET resolved = 1 WHERE id = ?", (question_id,))
+            await db.commit()
+        
+        return BaseResponse(success=True, message="Question resolved and added to knowledge base")
+        
+    except Exception as e:
+        logger.error(f"Resolve question error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/stats")
+async def api_get_stats():
+    """Get system statistics."""
+    try:
+        stats = await db_manager.get_stats()
+        return stats
+    except Exception as e:
+        logger.error(f"Get stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/health")
+async def api_health():
+    """Health check endpoint."""
     return {
         "status": "healthy",
-        "time": now_utc().isoformat(),
-        "active_connections": connection_tracker.count(),
-        "rate_limiter": rate_limiter.stats(),
-        "circuit_breakers": ai_engine.breakers_status(),
-        "stats_today": stats
+        "timestamp": datetime.utcnow().isoformat(),
+        "connections": connection_manager.get_connection_count(),
+        "uptime": time.time() - start_time
     }
 
-# ------------------------------------------------------------------------------
-# Entrypoint
-# ------------------------------------------------------------------------------
+# ==============================================================================
+# Application Entry Point
+# ==============================================================================
+
 if __name__ == "__main__":
-    eff_port = int(os.getenv("PORT", str(Config.PORT)))
-    import uvicorn
-    uvicorn.run(app, host=Config.HOST, port=eff_port, log_level="info")
+    logger.info("Starting AI Voice Agent System...")
+    logger.info(f"OpenAI Available: {OPENAI_AVAILABLE}")
+    logger.info(f"gTTS Available: {GTTS_AVAILABLE}")
+    logger.info(f"Embeddings Available: {EMBEDDINGS_AVAILABLE}")
+    
+    uvicorn.run(
+        app,
+        host=settings.HOST,
+        port=settings.PORT,
+        log_level="info" if not settings.DEBUG else "debug",
+        access_log=settings.DEBUG
+    )
